@@ -1,4 +1,4 @@
-FROM htcondor/mini:9.0.17-el7
+FROM htcondor/mini:23.0.25-el9
 
 RUN pip3 install pyyaml
 
