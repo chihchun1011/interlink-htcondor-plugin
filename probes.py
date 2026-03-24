@@ -83,9 +83,7 @@ def _translate_single_probe(k8s_probe):
 
     if "exec" in k8s_probe and k8s_probe["exec"] is not None:
         probe.type = PROBE_TYPE_EXEC
-        probe.exec_action = ExecAction(
-            command=k8s_probe["exec"].get("command", [])
-        )
+        probe.exec_action = ExecAction(command=k8s_probe["exec"].get("command", []))
         return probe
 
     logging.warning(
@@ -109,19 +107,25 @@ def translate_kubernetes_probes(container):
         probe = _translate_single_probe(container["startupProbe"])
         if probe is not None:
             startup_probes.append(probe)
-            logging.debug("Translated startup probe for container %s", container.get("name"))
+            logging.debug(
+                "Translated startup probe for container %s", container.get("name")
+            )
 
     if container.get("readinessProbe"):
         probe = _translate_single_probe(container["readinessProbe"])
         if probe is not None:
             readiness_probes.append(probe)
-            logging.debug("Translated readiness probe for container %s", container.get("name"))
+            logging.debug(
+                "Translated readiness probe for container %s", container.get("name")
+            )
 
     if container.get("livenessProbe"):
         probe = _translate_single_probe(container["livenessProbe"])
         if probe is not None:
             liveness_probes.append(probe)
-            logging.debug("Translated liveness probe for container %s", container.get("name"))
+            logging.debug(
+                "Translated liveness probe for container %s", container.get("name")
+            )
 
     return readiness_probes, liveness_probes, startup_probes
 
@@ -194,16 +198,14 @@ executeHTTPProbe() {
 }
 """)
 
-    lines.append(
-        f"""executeExecProbe() {{
+    lines.append(f"""executeExecProbe() {{
     local timeout="$1"
     shift
     local command=("$@")
     timeout "${{timeout}}" {singularity_exec_prefix} "${{command[@]}}"
     return $?
 }}
-"""
-    )
+""")
 
     lines.append(f"""
 workingPath="${{workingPath:-/tmp}}"

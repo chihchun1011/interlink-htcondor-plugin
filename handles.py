@@ -474,7 +474,7 @@ waitCtns() {
 }
 
 endScript() {
-  printf '%s\n' "$(date -Is --utc) End of script, highest exit code ${highestExitCode}..."
+  printf '%s\n' "$(date -Is --utc) End of script, exit: ${highestExitCode}."
   exit "${highestExitCode}"
 }
 """
@@ -498,8 +498,12 @@ def _clean_command_tokens(tokens):
 
 
 def produce_htcondor_singularity_script(
-    containers, metadata, container_commands, input_files,
-    probe_scripts=None, cleanup_scripts=None
+    containers,
+    metadata,
+    container_commands,
+    input_files,
+    probe_scripts=None,
+    cleanup_scripts=None,
 ):
     """Write the HTCondor job executable and submit description file.
 
@@ -648,9 +652,7 @@ def produce_htcondor_host_script(container, metadata):
     try:
         with open(executable_path, "w") as f:
             batch_macros = f"""#!{container['command'][-1]}
-""" + "\n".join(
-                container["args"][-1].split("; ")
-            )
+""" + "\n".join(container["args"][-1].split("; "))
 
             f.write(batch_macros)
 
@@ -900,8 +902,12 @@ def SubmitHandler():
             container_commands.append((container["name"], singularity_command))
 
         path = produce_htcondor_singularity_script(
-            containers, metadata, container_commands, all_input_files,
-            probe_scripts=probe_scripts, cleanup_scripts=cleanup_scripts,
+            containers,
+            metadata,
+            container_commands,
+            all_input_files,
+            probe_scripts=probe_scripts,
+            cleanup_scripts=cleanup_scripts,
         )
 
     else:
@@ -1123,10 +1129,16 @@ def StatusHandler():
                 f"Job file not found for pod {req['metadata'].get('name', '?')}"
             )
         except json.JSONDecodeError as e:
-            logging.error(f"Error parsing HTCondor response for pod {req['metadata'].get('name', '?')}: {e}")
+            logging.error(
+                "Error parsing HTCondor response for pod %s: %s",
+                req["metadata"].get("name", "?"),
+                e,
+            )
         except Exception as e:
             logging.error(
-                f"Error retrieving status for pod {req['metadata'].get('name', '?')}: {e}"
+                "Error retrieving status for pod %s: %s",
+                req["metadata"].get("name", "?"),
+                e,
             )
     return success_response(resp, 200)
 

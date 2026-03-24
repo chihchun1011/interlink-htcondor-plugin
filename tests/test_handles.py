@@ -9,13 +9,10 @@ the job executable by produce_htcondor_singularity_script.
 """
 
 import os
+import json as _json
 import sys
 import tempfile
-import types
-import unittest
 import unittest.mock as mock
-
-import pytest
 
 
 def _make_handles_module():
@@ -74,7 +71,9 @@ class TestPrepareProbesNoProbes:
         assert cleanup_script == ""
 
     def test_returns_empty_strings_when_probes_null(self):
-        container = _container(livenessProbe=None, readinessProbe=None, startupProbe=None)
+        container = _container(
+            livenessProbe=None, readinessProbe=None, startupProbe=None
+        )
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
         assert probe_script == ""
         assert cleanup_script == ""
@@ -182,22 +181,22 @@ class TestPrepareProbesAnnotations:
     def test_singularity_options_from_annotation(self):
         metadata = {
             **_BASE_METADATA,
-            "annotations": {"slurm-job.vk.io/singularity-options": "--nv --bind /scratch"},
+            "annotations": {
+                "slurm-job.vk.io/singularity-options": "--nv --bind /scratch"
+            },
         }
-        container = _container(
-            livenessProbe={"exec": {"command": ["true"]}}
-        )
+        container = _container(livenessProbe={"exec": {"command": ["true"]}})
         probe_script, _ = prepare_probes(container, metadata)
         assert '"--nv"' in probe_script
         assert '"--bind"' in probe_script
 
     def test_custom_singularity_path_from_config(self):
         orig = handles.InterLinkConfigInst.get("SingularityPath")
-        handles.InterLinkConfigInst["SingularityPath"] = "/opt/singularity/bin/singularity"
+        handles.InterLinkConfigInst["SingularityPath"] = (
+            "/opt/singularity/bin/singularity"
+        )
         try:
-            container = _container(
-                livenessProbe={"exec": {"command": ["true"]}}
-            )
+            container = _container(livenessProbe={"exec": {"command": ["true"]}})
             probe_script, _ = prepare_probes(container, _BASE_METADATA)
             assert '"/opt/singularity/bin/singularity"' in probe_script
         finally:
@@ -209,9 +208,7 @@ class TestPrepareProbesAnnotations:
     def test_no_singularity_path_defaults_to_singularity(self):
         orig = handles.InterLinkConfigInst.pop("SingularityPath", None)
         try:
-            container = _container(
-                livenessProbe={"exec": {"command": ["true"]}}
-            )
+            container = _container(livenessProbe={"exec": {"command": ["true"]}})
             probe_script, _ = prepare_probes(container, _BASE_METADATA)
             assert '"singularity"' in probe_script
         finally:
@@ -239,9 +236,7 @@ class TestPrepareProbesContainerNameNormalisation:
 
 class TestPrepareProbesReturnTypes:
     def test_returns_tuple_of_two_strings(self):
-        container = _container(
-            livenessProbe={"httpGet": {"port": 8080}}
-        )
+        container = _container(livenessProbe={"httpGet": {"port": 8080}})
         result = prepare_probes(container, _BASE_METADATA)
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -249,9 +244,7 @@ class TestPrepareProbesReturnTypes:
         assert isinstance(result[1], str)
 
     def test_both_strings_nonempty_when_probe_defined(self):
-        container = _container(
-            readinessProbe={"exec": {"command": ["true"]}}
-        )
+        container = _container(readinessProbe={"exec": {"command": ["true"]}})
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
         assert probe_script
         assert cleanup_script
@@ -272,8 +265,13 @@ def _fake_metadata(name="test-pod", uid="uid-123", annotations=None):
 
 
 def _make_script(
-    containers, container_commands, metadata=None, input_files=None,
-    probe_scripts=None, cleanup_scripts=None, data_root=None
+    containers,
+    container_commands,
+    metadata=None,
+    input_files=None,
+    probe_scripts=None,
+    cleanup_scripts=None,
+    data_root=None,
 ):
     """Call produce_htcondor_singularity_script in a temp dir and return the
     generated bash script content."""
@@ -289,8 +287,11 @@ def _make_script(
         handles.InterLinkConfigInst["DataRootFolder"] = ""
         # Ensure the executable path resolves in the tmpdir
         try:
-            sub_path = handles.produce_htcondor_singularity_script(
-                containers, metadata, container_commands, input_files,
+            handles.produce_htcondor_singularity_script(
+                containers,
+                metadata,
+                container_commands,
+                input_files,
                 probe_scripts=probe_scripts,
                 cleanup_scripts=cleanup_scripts,
             )
@@ -302,9 +303,7 @@ def _make_script(
             os.chdir(orig_dir)
 
         # Read the generated .sh file
-        sh_path = os.path.join(
-            tmpdir, f"{metadata['name']}-{metadata['uid']}.sh"
-        )
+        sh_path = os.path.join(tmpdir, f"{metadata['name']}-{metadata['uid']}.sh")
         with open(sh_path) as fh:
             return fh.read()
 
@@ -412,7 +411,7 @@ class TestRunCtnSingleContainer:
             [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
         )
         lines = script.splitlines()
-        bare = [l for l in lines if l.strip().startswith("singularity exec")]
+        bare = [ln for ln in lines if ln.strip().startswith("singularity exec")]
         assert bare == [], f"Bare singularity exec lines found: {bare}"
 
 
@@ -467,7 +466,8 @@ class TestRunCtnMultiContainer:
         script = _make_script(containers, commands)
         for name in ("a", "b", "c"):
             assert f"runCtn {name}" in script
-        assert script.index("runCtn a") < script.index("runCtn b") < script.index("runCtn c")
+        assert script.index("runCtn a") < script.index("runCtn b")
+        assert script.index("runCtn b") < script.index("runCtn c")
 
     def test_each_container_gets_correct_image(self):
         script = _make_script(
@@ -515,7 +515,8 @@ class TestRunCtnWithProbes:
 
     def test_cleanup_before_runctn_helpers(self):
         container = _container(
-            "c1", "docker://busybox:latest",
+            "c1",
+            "docker://busybox:latest",
             livenessProbe={"httpGet": {"port": 8080}},
         )
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
@@ -531,7 +532,8 @@ class TestRunCtnWithProbes:
 
     def test_probe_subshell_before_runctn_call(self):
         container = _container(
-            "c1", "docker://busybox:latest",
+            "c1",
+            "docker://busybox:latest",
             livenessProbe={"httpGet": {"port": 8080}},
         )
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
@@ -566,12 +568,9 @@ class TestCleanCommandTokens:
         assert "  " not in result
 
 
-
 # ---------------------------------------------------------------------------
 # API compatibility tests — interlink 0.6.1
 # ---------------------------------------------------------------------------
-
-import json as _json
 
 
 def _flask_test_client():
@@ -594,9 +593,13 @@ class TestCreateResponseFormat:
     """/create must return HTTP 200 with {PodUID, PodJID} (interlink 0.6.1 contract)."""
 
     def test_create_returns_200_not_201(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         # Stub out the parts that need a real HTCondor installation
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
@@ -604,7 +607,8 @@ class TestCreateResponseFormat:
         (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
         # Also stub produce_htcondor_singularity_script to avoid file I/O
         monkeypatch.setattr(
-            handles, "produce_htcondor_singularity_script",
+            handles,
+            "produce_htcondor_singularity_script",
             lambda *a, **kw: str(tmp_path / "fake.jdl"),
         )
         payload = _json.dumps({"pod": _make_pod(), "container": []})
@@ -613,14 +617,19 @@ class TestCreateResponseFormat:
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
 
     def test_create_response_has_poduid_and_podjid(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
         (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
         monkeypatch.setattr(
-            handles, "produce_htcondor_singularity_script",
+            handles,
+            "produce_htcondor_singularity_script",
             lambda *a, **kw: str(tmp_path / "fake.jdl"),
         )
         payload = _json.dumps({"pod": _make_pod(), "container": []})
@@ -633,14 +642,19 @@ class TestCreateResponseFormat:
         assert data["PodJID"] == "123.0"
 
     def test_create_response_has_no_extra_metadata_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
         (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
         monkeypatch.setattr(
-            handles, "produce_htcondor_singularity_script",
+            handles,
+            "produce_htcondor_singularity_script",
             lambda *a, **kw: str(tmp_path / "fake.jdl"),
         )
         payload = _json.dumps({"pod": _make_pod(), "container": []})
@@ -659,7 +673,9 @@ class TestStatusHandlerMultiPod:
 
     def _fake_condor_output(self, monkeypatch, jid, job_status=2):
         """Patch os.popen so condor_q returns a minimal JSON job record."""
-        job_record = _json.dumps([{"JobStatus": job_status, "ClusterId": int(jid.split(".")[0])}])
+        job_record = _json.dumps(
+            [{"JobStatus": job_status, "ClusterId": int(jid.split(".")[0])}]
+        )
 
         def fake_popen(cmd):
             class FakeProc:
@@ -667,6 +683,7 @@ class TestStatusHandlerMultiPod:
                     if f"condor_q {jid}" in cmd or f"condor_history {jid}" in cmd:
                         return job_record
                     return ""
+
                 def close(self):
                     pass
 
@@ -675,23 +692,33 @@ class TestStatusHandlerMultiPod:
         monkeypatch.setattr(os, "popen", fake_popen)
 
     def test_single_pod_returns_one_status(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
         pods = [_make_pod("pod-a", "uid-a")]
         client = _flask_test_client()
-        resp = client.get("/status", data=_json.dumps(pods), content_type="application/json")
+        resp = client.get(
+            "/status", data=_json.dumps(pods), content_type="application/json"
+        )
         assert resp.status_code == 200
         statuses = _json.loads(resp.data)
         assert len(statuses) == 1
         assert statuses[0]["name"] == "pod-a"
 
     def test_multiple_pods_returns_all_statuses(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._make_jid_file(tmp_path, "pod-b", "uid-b", "101.0")
 
@@ -707,15 +734,19 @@ class TestStatusHandlerMultiPod:
                         if jid in cmd:
                             return record
                     return ""
+
                 def close(self):
                     pass
+
             return FakeProc()
 
         monkeypatch.setattr(os, "popen", fake_popen)
 
         pods = [_make_pod("pod-a", "uid-a"), _make_pod("pod-b", "uid-b")]
         client = _flask_test_client()
-        resp = client.get("/status", data=_json.dumps(pods), content_type="application/json")
+        resp = client.get(
+            "/status", data=_json.dumps(pods), content_type="application/json"
+        )
         assert resp.status_code == 200
         statuses = _json.loads(resp.data)
         assert len(statuses) == 2
@@ -724,26 +755,38 @@ class TestStatusHandlerMultiPod:
         assert "pod-b" in names
 
     def test_status_response_has_init_containers_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
         pods = [_make_pod("pod-a", "uid-a")]
         client = _flask_test_client()
-        resp = client.get("/status", data=_json.dumps(pods), content_type="application/json")
+        resp = client.get(
+            "/status", data=_json.dumps(pods), content_type="application/json"
+        )
         statuses = _json.loads(resp.data)
         assert "initContainers" in statuses[0]
 
     def test_status_response_has_jid_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
         pods = [_make_pod("pod-a", "uid-a")]
         client = _flask_test_client()
-        resp = client.get("/status", data=_json.dumps(pods), content_type="application/json")
+        resp = client.get(
+            "/status", data=_json.dumps(pods), content_type="application/json"
+        )
         statuses = _json.loads(resp.data)
         assert statuses[0]["JID"] == "100.0"
         assert statuses[0]["UID"] == "uid-a"
@@ -751,15 +794,21 @@ class TestStatusHandlerMultiPod:
 
     def test_missing_pod_skipped_not_fatal(self, tmp_path, monkeypatch):
         """If one pod's JID file doesn't exist, others still get status."""
-        monkeypatch.setattr(handles, "InterLinkConfigInst", {
-            "DataRootFolder": str(tmp_path) + "/",
-        })
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "DataRootFolder": str(tmp_path) + "/",
+            },
+        )
         # Only pod-a has a JID file; pod-b does not
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
         pods = [_make_pod("pod-a", "uid-a"), _make_pod("pod-b", "uid-b")]
         client = _flask_test_client()
-        resp = client.get("/status", data=_json.dumps(pods), content_type="application/json")
+        resp = client.get(
+            "/status", data=_json.dumps(pods), content_type="application/json"
+        )
         assert resp.status_code == 200
         statuses = _json.loads(resp.data)
         # Only pod-a should be in the response
@@ -775,9 +824,12 @@ class TestSystemInfoEndpoint:
             class FakeProc:
                 def read(self):
                     return "TotalMachines=10\n"
+
                 def close(self):
                     pass
+
             return FakeProc()
+
         monkeypatch.setattr(os, "popen", fake_popen)
         client = _flask_test_client()
         resp = client.get("/system-info")
@@ -788,9 +840,12 @@ class TestSystemInfoEndpoint:
             class FakeProc:
                 def read(self):
                     return "TotalMachines=10\n"
+
                 def close(self):
                     pass
+
             return FakeProc()
+
         monkeypatch.setattr(os, "popen", fake_popen)
         client = _flask_test_client()
         resp = client.get("/system-info")
@@ -804,9 +859,12 @@ class TestSystemInfoEndpoint:
             class FakeProc:
                 def read(self):
                     return "TotalMachines=5 TotalCPUs=20\n"
+
                 def close(self):
                     pass
+
             return FakeProc()
+
         monkeypatch.setattr(os, "popen", fake_popen)
         client = _flask_test_client()
         resp = client.get("/system-info")
@@ -817,6 +875,7 @@ class TestSystemInfoEndpoint:
     def test_system_info_not_connected_on_error(self, monkeypatch):
         def fake_popen(cmd):
             raise OSError("condor not found")
+
         monkeypatch.setattr(os, "popen", fake_popen)
         client = _flask_test_client()
         resp = client.get("/system-info")

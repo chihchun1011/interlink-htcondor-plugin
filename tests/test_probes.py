@@ -10,8 +10,6 @@ Tests cover:
 - generate_probe_cleanup_script: verifying the cleanup/trap section.
 """
 
-import pytest
-
 from probes import (
     PROBE_TYPE_EXEC,
     PROBE_TYPE_HTTP,
@@ -24,7 +22,6 @@ from probes import (
     generate_probe_script,
     translate_kubernetes_probes,
 )
-
 
 # ---------------------------------------------------------------------------
 # _translate_single_probe
@@ -161,7 +158,9 @@ class TestBuildProbeArgs:
         probe = ProbeCommand(
             probe_type=PROBE_TYPE_HTTP,
             timeout_seconds=3,
-            http_get=HTTPGetAction(scheme="HTTPS", host="myhost", port=9443, path="/check"),
+            http_get=HTTPGetAction(
+                scheme="HTTPS", host="myhost", port=9443, path="/check"
+            ),
         )
         args = _build_probe_args(probe)
         assert '"HTTPS"' in args
@@ -259,16 +258,20 @@ class TestGenerateProbeScript:
 
     def test_http_probe_args_in_script(self):
         probe = self._http_probe(
-            http_get=HTTPGetAction(scheme="HTTP", host="localhost", port=8080, path="/healthz")
+            http_get=HTTPGetAction(
+                scheme="HTTP", host="localhost", port=8080, path="/healthz"
+            )
         )
         script = generate_probe_script(self.CONTAINER, self.IMAGE, [probe], [], [])
         assert "8080" in script
         assert "/healthz" in script
 
     def test_container_name_with_dashes_normalised_in_var(self):
-        """Dashes in container names must be replaced with underscores in variable names."""
+        """Dashes in container names replaced with underscores in variable names."""
         probe = self._http_probe()
-        script = generate_probe_script("my-fancy-container", self.IMAGE, [probe], [], [])
+        script = generate_probe_script(
+            "my-fancy-container", self.IMAGE, [probe], [], []
+        )
         assert "READINESS_PROBE_my_fancy_container_0_PID" in script
 
     def test_orchestration_sub_shell_present(self):
@@ -292,16 +295,16 @@ class TestGenerateProbeScript:
         assert '"--bind"' in script
 
     def test_no_startup_message_when_no_startup(self):
-        """When no startup probes are defined the no-startup fallback text is present."""
+        """When no startup probes are defined the fallback text is present."""
         probe = self._http_probe()
         script = generate_probe_script(self.CONTAINER, self.IMAGE, [probe], [], [])
         assert "No startup probes defined" in script
 
     def test_all_probes_together(self):
         r = self._http_probe()
-        l = self._http_probe()
+        lv = self._http_probe()
         s = self._exec_probe()
-        script = generate_probe_script(self.CONTAINER, self.IMAGE, [r], [l], [s])
+        script = generate_probe_script(self.CONTAINER, self.IMAGE, [r], [lv], [s])
         assert "startup" in script
         assert "readiness" in script
         assert "liveness" in script
