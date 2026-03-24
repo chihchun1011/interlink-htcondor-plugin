@@ -389,7 +389,24 @@ def produce_htcondor_singularity_script(containers, metadata, commands, input_fi
     if requested_memory == 0:
         requested_memory = 1
 
-    prefix_ = f"\n{InterLinkConfigInst['CommandPrefix']}"
+    annotations = metadata.get("annotations", {})
+    prefix_ = ""
+
+    # Export POD_IP from annotation
+    pod_ip = annotations.get("interlink.eu/pod-ip", "")
+    if pod_ip:
+        prefix_ += f"\nexport POD_IP={pod_ip}\n"
+
+    # CommandPrefix from config
+    command_prefix = InterLinkConfigInst.get("CommandPrefix", "")
+    if command_prefix:
+        prefix_ += f"\n{command_prefix}"
+
+    # Wstunnel client commands from annotation
+    wstunnel_commands = annotations.get("interlink.eu/wstunnel-client-commands", "")
+    if wstunnel_commands:
+        prefix_ += f"\n{wstunnel_commands}\n"
+
     try:
         with open(executable_path, "w") as f:
             batch_macros = """#!/bin/bash
