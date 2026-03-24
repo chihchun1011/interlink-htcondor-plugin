@@ -1,6 +1,6 @@
 # InterLink HTCondor Sidecar Plugin
 
-[![InterLink Compatible](https://img.shields.io/badge/InterLink-v0.5.0+-blue)](https://github.com/interlink-hq/interLink)
+[![InterLink Compatible](https://img.shields.io/badge/InterLink-v0.6.1+-blue)](https://github.com/interlink-hq/interLink)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 
 This repository contains an InterLink HTCondor sidecar plugin — a container manager that interfaces with
@@ -10,8 +10,11 @@ HTCondor batch systems using Singularity/Apptainer.
 ## Features
 
 - **Full Kubernetes Pod Support**: Handles containers, volumes, secrets, configMaps, and resource requests
+- **Multi-Container Pods**: All containers in a pod run concurrently via the `runCtn`/`waitCtns`/`endScript` pattern; each container runs in the background and the job exits with the highest exit code
+- **Kubernetes Probe Support**: Translates `livenessProbe`, `readinessProbe`, and `startupProbe` specs to bash scripts; supports `httpGet` (curl-based) and `exec` (Singularity exec) probe types
 - **Dual Execution Modes**: Singularity containers and host-based script execution
-- **InterLink API v0.5.0+ Compatible**: Modern API with proper error handling and status codes
+- **InterLink API v0.6.1+ Compatible**: Correct HTTP status codes, multi-pod `/status` responses, and `initContainers` field matching the `PodStatus` type
+- **HTCondor Health Check**: `/system-info` endpoint reports cluster connectivity via `condor_status -totals`
 - **Comprehensive Logging**: Aggregated stdout, stderr, and HTCondor job logs
 - **Real-time Status**: Live job status with actual timestamps from HTCondor
 - **Robust Error Handling**: Detailed error responses and validation
@@ -107,14 +110,15 @@ Once running you should see output similar to:
  * Running on http://0.0.0.0:4000
 ```
 
-The server exposes four REST endpoints:
+The server exposes five REST endpoints:
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/create` | Submit a new pod as an HTCondor job |
 | `POST` | `/delete` | Cancel and remove a running job |
-| `GET` | `/status` | Query the current status of a pod |
+| `GET` | `/status` | Query the current status of one or more pods |
 | `GET` | `/getLogs` | Retrieve job stdout / stderr |
+| `GET` | `/system-info` | Report HTCondor cluster connectivity |
 
 ---
 
@@ -143,8 +147,8 @@ Expected response (healthy):
 
 #### 4b — Submit a test pod (`POST /create`)
 
-The request body follows the InterLink API v0.5.0+ **CreateStruct** format: a `pod` object
-(standard Kubernetes pod spec) and an optional `container` array with resolved volumes.
+The request body follows the InterLink API v0.6.1 **RetrievedPodData** format: a `pod` object
+(standard Kubernetes pod spec) and a `container` array with resolved volumes.
 
 ```bash
 curl -s -X POST http://localhost:4000/create \
@@ -176,17 +180,12 @@ curl -s -X POST http://localhost:4000/create \
   }' | python3 -m json.tool
 ```
 
-On success (HTTP 201) the plugin returns the HTCondor cluster job ID:
+On success (HTTP 200) the plugin returns the HTCondor cluster job ID:
 
 ```json
 {
     "PodUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-    "PodJID": "12345",
-    "metadata": {
-        "name":      "test-pod",
-        "namespace": "default",
-        "uid":       "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    }
+    "PodJID": "12345"
 }
 ```
 
@@ -232,7 +231,8 @@ Example response while the job is running:
                 "image": "docker://busybox:latest",
                 "imageID": "docker://busybox:latest"
             }
-        ]
+        ],
+        "initContainers": []
     }
 ]
 ```
@@ -247,7 +247,28 @@ HTCondor job status codes map to Kubernetes container states as follows:
 | Removed | 3 | `terminated` — `Cancelled` |
 | Held | 5 | `waiting` — `JobHeld` |
 
-#### 4d — Delete a pod (`POST /delete`)
+#### 4d — HTCondor connectivity check (`GET /system-info`)
+
+Returns the cluster connectivity status using `condor_status -totals`:
+
+```bash
+curl -s http://localhost:4000/system-info | python3 -m json.tool
+```
+
+Example response when the collector is reachable:
+
+```json
+{
+    "status": "ok",
+    "timestamp": "2024-01-15T10:30:00Z",
+    "htcondor_connected": true,
+    "condor_status_output": "Total Owner Claimed Unclaimed Matched Preempting Drain\n  10     0       8         2       0          0     0\n"
+}
+```
+
+If the collector is unreachable, `htcondor_connected` is `false` and `status` is `"warning"`.
+
+#### 4e — Delete a pod (`POST /delete`)
 
 ```bash
 curl -s -X POST http://localhost:4000/delete \
@@ -295,6 +316,49 @@ kubectl get pod test-pod -w
 
 The test pod runs `sleep 10` inside a `busybox` Singularity container and mounts both the ConfigMap and Secret as volumes.
 
+#### Multi-container pods
+
+When a pod spec contains more than one container, each container runs concurrently in the background
+via the `runCtn`/`waitCtns`/`endScript` helper pattern (matching the SLURM plugin). The HTCondor job
+exits with the highest exit code of all containers. Per-container stdout/stderr is saved to
+`${workingPath}/run-<container-name>.out`.
+
+#### Kubernetes probes
+
+`livenessProbe`, `readinessProbe`, and `startupProbe` specs are translated to bash scripts and run
+in background sub-shells alongside the container. Supported probe types:
+
+| Probe type | Implementation |
+|---|---|
+| `httpGet` | `curl -sf http://localhost:<port><path>` |
+| `exec` | `singularity exec <image> <command>` |
+| `tcpSocket` | Not supported (warning emitted, probe skipped) |
+
+Example pod spec with probes:
+
+```yaml
+containers:
+  - name: my-app
+    image: docker://myimage:latest
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    readinessProbe:
+      exec:
+        command: ["cat", "/tmp/ready"]
+    startupProbe:
+      httpGet:
+        path: /startup
+        port: 8080
+        initialDelaySeconds: 5
+```
+
+Singularity options for exec probes can be set via the `slurm-job.vk.io/singularity-options`
+pod annotation.
+
 #### Host-based script execution
 
 A special execution mode is triggered when the container image name starts with the literal string
@@ -337,6 +401,8 @@ Inside the container the plugin starts automatically (`python3 handles.py`) alon
 | `FileNotFoundError: .interlink/…` | Required directories missing | Run `mkdir -p .interlink out err log` |
 | Pod stuck in `ContainerCreating` | HTCondor job is queued (Idle) | Run `condor_q` to inspect the queue; check for hold reasons |
 | Flask import error | Python dependencies not installed | Run `pip3 install flask pyyaml` |
+| `/system-info` returns `htcondor_connected: false` | Collector unreachable | Check HTCondor collector host/port settings; verify `condor_status` works from the shell |
+| Probe type `tcpSocket` not working | Not supported | Use `httpGet` or `exec` probe types; `tcpSocket` probes are skipped with a warning |
 
 ---
 
