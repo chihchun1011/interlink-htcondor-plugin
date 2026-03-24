@@ -929,13 +929,8 @@ def SubmitHandler():
         resp = {
             "PodUID": pod["metadata"]["uid"],
             "PodJID": str(out_jid),
-            "metadata": {
-                "name": pod["metadata"]["name"],
-                "namespace": pod["metadata"].get("namespace", "default"),
-                "uid": pod["metadata"]["uid"],
-            },
         }
-        return success_response(resp, 201)
+        return success_response(resp, 200)
     except Exception as e:
         logging.error(f"Job submission failed: {e}")
         return error_response(f"Job submission failed: {str(e)}", 500)
@@ -1003,12 +998,12 @@ def StatusHandler():
             return error_response("Status request must be an array", 400)
         if len(req_list) == 0:
             return error_response("Empty request array", 400)
-        req = req_list[0]
-        # Validate request structure
-        is_valid, validation_message = validate_pod_request(req)
-        if not is_valid:
-            logging.error(f"Invalid status request: {validation_message}")
-            return error_response(f"Invalid request: {validation_message}", 400)
+        # Validate every pod in the list up-front
+        for req in req_list:
+            is_valid, validation_message = validate_pod_request(req)
+            if not is_valid:
+                logging.error(f"Invalid status request: {validation_message}")
+                return error_response(f"Invalid request: {validation_message}", 400)
     except json.JSONDecodeError as e:
         logging.error(f"Invalid JSON in status request: {e}")
         return error_response("Invalid JSON format", 400)
@@ -1016,121 +1011,124 @@ def StatusHandler():
         logging.error(f"Error processing status request: {e}")
         return error_response("Error processing request", 400)
 
-    # ELABORATE RESPONSE #################
-    try:
-        jid_file = (
-            InterLinkConfigInst["DataRootFolder"]
-            + req["metadata"]["name"]
-            + "-"
-            + req["metadata"]["uid"]
-            + ".jid"
-        )
-        with open(jid_file, "r") as f:
-            jid_job = f.read().strip()
-        podname = req["metadata"]["name"]
-        podnamespace = req["metadata"].get("namespace", "default")
-        poduid = req["metadata"]["uid"]
-        # Query HTCondor for job status
-        process = os.popen(f"condor_q {jid_job} --json")
-        preprocessed = process.read()
-        process.close()
-        if not preprocessed.strip():
-            # Job not found in queue, check history
-            process = os.popen(f"condor_history {jid_job} --json")
+    # ELABORATE RESPONSE — process ALL pods in the list #################
+    resp = []
+    for req in req_list:
+        try:
+            jid_file = (
+                InterLinkConfigInst["DataRootFolder"]
+                + req["metadata"]["name"]
+                + "-"
+                + req["metadata"]["uid"]
+                + ".jid"
+            )
+            with open(jid_file, "r") as f:
+                jid_job = f.read().strip()
+            podname = req["metadata"]["name"]
+            podnamespace = req["metadata"].get("namespace", "default")
+            poduid = req["metadata"]["uid"]
+            # Query HTCondor for job status
+            process = os.popen(f"condor_q {jid_job} --json")
             preprocessed = process.read()
             process.close()
-        if not preprocessed.strip():
-            return error_response(
-                f"Job {jid_job} not found in HTCondor queue or history", 404
+            if not preprocessed.strip():
+                # Job not found in queue, check history
+                process = os.popen(f"condor_history {jid_job} --json")
+                preprocessed = process.read()
+                process.close()
+            if not preprocessed.strip():
+                logging.error(f"Job {jid_job} not found in HTCondor queue or history")
+                continue
+            job_data = json.loads(preprocessed)
+            if not job_data:
+                logging.error(f"No job data found for job {jid_job}")
+                continue
+            job = job_data[0]
+            status = job.get("JobStatus", 0)
+            # Get actual timestamps from HTCondor
+            current_time = datetime.utcnow().isoformat() + "Z"
+            start_time = (
+                datetime.fromtimestamp(job.get("JobStartDate", 0)).isoformat() + "Z"
+                if job.get("JobStartDate")
+                else current_time
             )
-        job_data = json.loads(preprocessed)
-        if not job_data:
-            return error_response(f"No job data found for job {jid_job}", 404)
-        job = job_data[0]
-        status = job.get("JobStatus", 0)
-        # Get actual timestamps from HTCondor
-        current_time = datetime.utcnow().isoformat() + "Z"
-        start_time = (
-            datetime.fromtimestamp(job.get("JobStartDate", 0)).isoformat() + "Z"
-            if job.get("JobStartDate")
-            else current_time
-        )
-        completion_time = (
-            datetime.fromtimestamp(job.get("CompletionDate", 0)).isoformat() + "Z"
-            if job.get("CompletionDate")
-            else current_time
-        )
-        # Map HTCondor status to Kubernetes container states
-        if status == 1:  # Idle
-            state = {"waiting": {"reason": "ContainerCreating"}}
-            readiness = False
-        elif status == 2:  # Running
-            state = {"running": {"startedAt": start_time}}
-            readiness = True
-        elif status == 4:  # Completed
-            state = {
-                "terminated": {
-                    "startedAt": start_time,
-                    "finishedAt": completion_time,
-                    "exitCode": job.get("ExitCode", 0),
-                    "reason": "Completed",
+            completion_time = (
+                datetime.fromtimestamp(job.get("CompletionDate", 0)).isoformat() + "Z"
+                if job.get("CompletionDate")
+                else current_time
+            )
+            # Map HTCondor status to Kubernetes container states
+            if status == 1:  # Idle
+                state = {"waiting": {"reason": "ContainerCreating"}}
+                readiness = False
+            elif status == 2:  # Running
+                state = {"running": {"startedAt": start_time}}
+                readiness = True
+            elif status == 4:  # Completed
+                state = {
+                    "terminated": {
+                        "startedAt": start_time,
+                        "finishedAt": completion_time,
+                        "exitCode": job.get("ExitCode", 0),
+                        "reason": "Completed",
+                    }
                 }
-            }
-            readiness = False
-        elif status == 3:  # Removed
-            state = {
-                "terminated": {
-                    "startedAt": start_time,
-                    "finishedAt": completion_time,
-                    "reason": "Cancelled",
+                readiness = False
+            elif status == 3:  # Removed
+                state = {
+                    "terminated": {
+                        "startedAt": start_time,
+                        "finishedAt": completion_time,
+                        "reason": "Cancelled",
+                    }
                 }
-            }
-            readiness = False
-        elif status == 5:  # Held
-            state = {
-                "waiting": {
-                    "reason": "JobHeld",
-                    "message": job.get("HoldReason", "Job held by HTCondor"),
+                readiness = False
+            elif status == 5:  # Held
+                state = {
+                    "waiting": {
+                        "reason": "JobHeld",
+                        "message": job.get("HoldReason", "Job held by HTCondor"),
+                    }
                 }
-            }
-            readiness = False
-        else:
-            state = {"waiting": {"reason": "Unknown"}}
-            readiness = False
-        # Build container status list
-        containers = []
-        for c in req["spec"]["containers"]:
-            containers.append(
+                readiness = False
+            else:
+                state = {"waiting": {"reason": "Unknown"}}
+                readiness = False
+            # Build container status list
+            containers = []
+            for c in req["spec"]["containers"]:
+                containers.append(
+                    {
+                        "name": c["name"],
+                        "state": state,
+                        "lastState": {},
+                        "ready": readiness,
+                        "restartCount": 0,
+                        "image": c.get("image", "unknown"),
+                        "imageID": c.get("image", "unknown"),
+                    }
+                )
+            resp.append(
                 {
-                    "name": c["name"],
-                    "state": state,
-                    "lastState": {},
-                    "ready": readiness,
-                    "restartCount": 0,
-                    "image": c.get("image", "unknown"),
-                    "imageID": c.get("image", "unknown"),
+                    "name": podname,
+                    "UID": poduid,
+                    "namespace": podnamespace,
+                    "JID": jid_job,
+                    "containers": containers,
+                    "initContainers": [],
                 }
             )
-        # Build response in expected format
-        resp = [
-            {
-                "name": podname,
-                "UID": poduid,
-                "namespace": podnamespace,
-                "JID": jid_job,
-                "containers": containers,
-            }
-        ]
-        return success_response(resp, 200)
-    except FileNotFoundError as e:
-        logging.error(f"Job file not found: {e}")
-        return error_response("Pod not found", 404)
-    except json.JSONDecodeError as e:
-        logging.error(f"Error parsing HTCondor response: {e}")
-        return error_response("Error parsing job status", 500)
-    except Exception as e:
-        logging.error(f"Error retrieving pod status: {e}")
-        return error_response(f"Status retrieval failed: {str(e)}", 500)
+        except FileNotFoundError:
+            logging.error(
+                f"Job file not found for pod {req['metadata'].get('name', '?')}"
+            )
+        except json.JSONDecodeError as e:
+            logging.error(f"Error parsing HTCondor response for pod {req['metadata'].get('name', '?')}: {e}")
+        except Exception as e:
+            logging.error(
+                f"Error retrieving status for pod {req['metadata'].get('name', '?')}: {e}"
+            )
+    return success_response(resp, 200)
 
 
 def LogsHandler():
@@ -1148,11 +1146,50 @@ def LogsHandler():
     return json.dumps(resp), 200
 
 
+def SystemInfoHandler():
+    """Health-check endpoint that reports HTCondor connectivity.
+
+    Mirrors the /system-info endpoint in the SLURM plugin (see
+    pkg/slurm/SystemInfo.go), adapted for HTCondor: runs ``condor_status -totals``
+    to verify the schedd/collector is reachable and returns a JSON payload
+    with status, timestamp, and the condensed condor_status output.
+    """
+    logging.info("HTCondor Sidecar: received SystemInfo call")
+
+    response = {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "htcondor_connected": False,
+    }
+
+    try:
+        process = os.popen("condor_status -totals 2>&1")
+        output = process.read()
+        process.close()
+        if "TotalMachines" in output or "Machines" in output or "Slots" in output:
+            response["htcondor_connected"] = True
+            response["condor_status_output"] = output.strip()
+        else:
+            # condor_status ran but returned unexpected output — treat as warning
+            response["status"] = "warning"
+            response["htcondor_connected"] = False
+            response["error"] = "condor_status returned unexpected output"
+            response["condor_status_output"] = output.strip()
+    except Exception as e:
+        logging.warning(f"Failed to execute condor_status: {e}")
+        response["status"] = "warning"
+        response["htcondor_connected"] = False
+        response["error"] = str(e)
+
+    return jsonify(response), 200
+
+
 app = Flask(__name__)
 app.add_url_rule("/create", view_func=SubmitHandler, methods=["POST"])
 app.add_url_rule("/delete", view_func=StopHandler, methods=["POST"])
 app.add_url_rule("/status", view_func=StatusHandler, methods=["GET"])
 app.add_url_rule("/getLogs", view_func=LogsHandler, methods=["GET"])
+app.add_url_rule("/system-info", view_func=SystemInfoHandler, methods=["GET"])
 
 if __name__ == "__main__":
     app.run(port=args.port, host="0.0.0.0", debug=True)
