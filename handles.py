@@ -441,10 +441,71 @@ def _is_main_command_line(stripped):
     return True
 
 
+# Bash helper functions injected into every multi-container job script.
+# These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
+# each Singularity container runs in the background and all exit codes are
+# collected before the job terminates.
+_RUN_CTN_HELPERS = r"""
+runCtn() {
+  local ctn="$1"
+  shift
+  ( "$@" ) > "${workingPath}/run-${ctn}.out" 2>&1 &
+  local pid="$!"
+  printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
+  pidCtns="${pidCtns} ${pid}:${ctn}"
+}
+
+waitCtns() {
+  for pidCtn in ${pidCtns}; do
+    local pid="${pidCtn%:*}"
+    local ctn="${pidCtn#*:}"
+    printf '%s\n' "$(date -Is --utc) Waiting for ${ctn} (pid ${pid})..."
+    wait "${pid}"
+    local exitCode="$?"
+    printf '%s\n' "${exitCode}" > "${workingPath}/run-${ctn}.status"
+    printf '%s\n' "$(date -Is --utc) ${ctn} ended with status ${exitCode}."
+  done
+  for filestatus in "${workingPath}"/*.status; do
+    [ -f "$filestatus" ] || continue
+    local exitCode
+    exitCode=$(cat "$filestatus")
+    [ "${highestExitCode}" -lt "${exitCode}" ] && highestExitCode="${exitCode}"
+  done
+}
+
+endScript() {
+  printf '%s\n' "$(date -Is --utc) End of script, highest exit code ${highestExitCode}..."
+  exit "${highestExitCode}"
+}
+"""
+
+
+def _clean_command_tokens(tokens):
+    """Join and clean a list of singularity command tokens into a single string.
+
+    Wraps the token that follows a ``-c`` flag in single quotes (so the shell
+    does not re-split it), then strips empty double-quoted tokens and collapses
+    extra whitespace.
+    """
+    result = list(tokens)
+    for i in range(1, len(result)):
+        if result[i - 1] == "-c":
+            result[i] = "'" + result[i] + "'"
+    line = " ".join(result)
+    line = re.sub(r'\s*""\s*', " ", line)
+    line = re.sub(r" {2,}", " ", line)
+    return line.strip()
+
+
 def produce_htcondor_singularity_script(
-    containers, metadata, commands, input_files, probe_scripts=None, cleanup_scripts=None
+    containers, metadata, container_commands, input_files,
+    probe_scripts=None, cleanup_scripts=None
 ):
     """Write the HTCondor job executable and submit description file.
+
+    Each container is launched in the background via a ``runCtn()`` bash
+    helper, mirroring the SLURM plugin's pattern.  ``waitCtns()`` collects
+    all exit codes, and ``endScript()`` exits with the highest one.
 
     Parameters
     ----------
@@ -452,16 +513,19 @@ def produce_htcondor_singularity_script(
         List of container dicts from pod["spec"]["containers"].
     metadata:
         Pod metadata dict.
-    commands:
-        Flat list of command tokens for the singularity exec call.
+    container_commands:
+        List of ``(container_name, [cmd_tokens])`` tuples, one per container,
+        in the order they should be launched.  Each entry is produced by the
+        SubmitHandler container loop.
     input_files:
-        Files that HTCondor must transfer to the execute node.
+        Files that HTCondor must transfer to the execute node (deduplicated
+        across all containers by the caller).
     probe_scripts:
         Probe sub-shell snippets produced by prepare_probes(), one per
-        container that defines probes. Pass None (default) for no probes.
+        container that defines probes.  Pass None (default) for no probes.
     cleanup_scripts:
         Cleanup trap snippets produced by prepare_probes(), matching
-        probe_scripts. Pass None (default) for no probes.
+        probe_scripts.  Pass None (default) for no probes.
     """
     if probe_scripts is None:
         probe_scripts = []
@@ -514,40 +578,36 @@ def produce_htcondor_singularity_script(
 
     try:
         with open(executable_path, "w") as f:
-            batch_macros = """#!/bin/bash
-"""
-            commands_joined = [prefix_]
-            for i in range(0, len(commands)):
-                if i > 0:
-                    if "-c" in commands[i - 1]:
-                        commands[i] = "'" + commands[i] + "'"
-            commands_joined.append(" ".join(commands))
-            cleaned = []
-            for cmd in commands_joined:
-                c = re.sub(r'\s*""\s*', " ", cmd)
-                c = re.sub(r" {2,}", " ", c)
-                cleaned.append(c.strip())
-            commands_joined = cleaned
+            # ---- shebang ------------------------------------------------
+            script_body = "#!/bin/bash\n"
 
-            script_body = batch_macros + "\n"
-            # Inject cleanup traps immediately after the shebang
+            # ---- probe cleanup traps (must be defined before any trap) --
             for cs in cleanup_scripts:
-                script_body += cs + "\n"
-            script_body += "\n".join(commands_joined)
-            # Inject probe sub-shells before the main command block
-            if probe_scripts:
-                probe_block = "\n".join(probe_scripts)
-                # Insert probe block before the first non-empty command line
-                lines = script_body.splitlines(keepends=True)
-                insert_at = len(lines)
-                for idx, line in enumerate(lines):
-                    stripped = line.strip()
-                    # Skip shebang, blank lines, exports, and cleanup traps
-                    if _is_main_command_line(stripped):
-                        insert_at = idx
-                        break
-                lines.insert(insert_at, probe_block + "\n")
-                script_body = "".join(lines)
+                script_body += "\n" + cs + "\n"
+
+            # ---- runCtn / waitCtns / endScript helpers ------------------
+            script_body += _RUN_CTN_HELPERS
+
+            # ---- preamble (exports, wstunnel, command prefix, etc.) -----
+            if prefix_.strip():
+                script_body += "\n" + prefix_.strip() + "\n"
+
+            # ---- probe background sub-shells ----------------------------
+            for ps in probe_scripts:
+                script_body += "\n" + ps + "\n"
+
+            # ---- main: run every container in background ----------------
+            script_body += "\nhighestExitCode=0\n"
+            script_body += 'pidCtns=""\n'
+            script_body += "export workingPath=$(pwd)\n\n"
+
+            for ctn_name, cmd_tokens in container_commands:
+                cleaned = _clean_command_tokens(cmd_tokens)
+                script_body += f"runCtn {ctn_name} {cleaned}\n"
+
+            # ---- wait for all containers and exit -----------------------
+            script_body += "\nwaitCtns\nendScript\n"
+
             f.write(script_body)
 
         job = f"""
@@ -714,12 +774,18 @@ def SubmitHandler():
     # print("Requested pod metadata name is: ", pod["metadata"]["name"])
     metadata = pod.get("metadata", {})
     containers = pod.get("spec", {}).get("containers", [])
-    singularity_commands = []
 
     # NORMAL CASE
     if "host" not in containers[0]["image"]:
         probe_scripts = []
         cleanup_scripts = []
+        # container_commands collects (name, [tokens]) tuples for every container,
+        # mirroring the SLURM plugin's runCtn pattern.
+        container_commands = []
+        # all_input_files is accumulated across all containers (deduped via seen set)
+        all_input_files = []
+        seen_input_files = set()
+
         for container in containers:
             logging.info(
                 f"Beginning script generation for container {container['name']}"
@@ -766,12 +832,15 @@ def SubmitHandler():
                 image = "docker://" + container["image"]
             # image = container["image"]
             logging.info("Appending all commands together...")
-            input_files = []
             for mount in mounts[-1].split(","):
                 if "/cvmfs" not in mount:
-                    input_files.append(mount.split(":")[0])
-                if env_path:
-                    input_files.append(env_path)
+                    mount_src = mount.split(":")[0]
+                    if mount_src and mount_src not in seen_input_files:
+                        all_input_files.append(mount_src)
+                        seen_input_files.add(mount_src)
+                if env_path and env_path not in seen_input_files:
+                    all_input_files.append(env_path)
+                    seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
                 if "/cvmfs" not in mount:
@@ -827,10 +896,11 @@ def SubmitHandler():
                 singularity_command = (
                     [pre_exec] + commstr1 + env_flags + local_mounts + [image]
                 )
-            # print("singularity_command:", singularity_command)
-            singularity_commands.append(singularity_command)
+            # Collect as (name, tokens) for runCtn pattern
+            container_commands.append((container["name"], singularity_command))
+
         path = produce_htcondor_singularity_script(
-            containers, metadata, singularity_command, input_files,
+            containers, metadata, container_commands, all_input_files,
             probe_scripts=probe_scripts, cleanup_scripts=cleanup_scripts,
         )
 

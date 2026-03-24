@@ -13,18 +13,9 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock as mock
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Minimal stubs so handles.py can be imported without a real config file or
-# HTCondor installation.
-# ---------------------------------------------------------------------------
-
-# Stub out yaml / flask before importing handles so that argument parsing and
-# config reading don't run at import time.
-import importlib
-import unittest.mock as mock
 
 
 def _make_handles_module():
@@ -264,3 +255,313 @@ class TestPrepareProbesReturnTypes:
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
         assert probe_script
         assert cleanup_script
+
+
+# ---------------------------------------------------------------------------
+# produce_htcondor_singularity_script — runCtn / multi-container tests
+# ---------------------------------------------------------------------------
+
+
+def _fake_metadata(name="test-pod", uid="uid-123", annotations=None):
+    return {
+        "name": name,
+        "uid": uid,
+        "namespace": "default",
+        "annotations": annotations or {},
+    }
+
+
+def _make_script(
+    containers, container_commands, metadata=None, input_files=None,
+    probe_scripts=None, cleanup_scripts=None, data_root=None
+):
+    """Call produce_htcondor_singularity_script in a temp dir and return the
+    generated bash script content."""
+    if metadata is None:
+        metadata = _fake_metadata()
+    if input_files is None:
+        input_files = []
+
+    orig_dir = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.chdir(tmpdir)
+        orig_dr = handles.InterLinkConfigInst.get("DataRootFolder")
+        handles.InterLinkConfigInst["DataRootFolder"] = ""
+        # Ensure the executable path resolves in the tmpdir
+        try:
+            sub_path = handles.produce_htcondor_singularity_script(
+                containers, metadata, container_commands, input_files,
+                probe_scripts=probe_scripts,
+                cleanup_scripts=cleanup_scripts,
+            )
+        finally:
+            if orig_dr is None:
+                handles.InterLinkConfigInst.pop("DataRootFolder", None)
+            else:
+                handles.InterLinkConfigInst["DataRootFolder"] = orig_dr
+            os.chdir(orig_dir)
+
+        # Read the generated .sh file
+        sh_path = os.path.join(
+            tmpdir, f"{metadata['name']}-{metadata['uid']}.sh"
+        )
+        with open(sh_path) as fh:
+            return fh.read()
+
+
+_ONE_CONTAINER = [_container("c1", "docker://busybox:latest")]
+_TWO_CONTAINERS = [
+    _container("c1", "docker://busybox:latest"),
+    _container("c2", "docker://alpine:latest"),
+]
+
+
+class TestRunCtnHelpers:
+    """Script always includes the runCtn/waitCtns/endScript bash helpers."""
+
+    def test_shebang_present(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert script.startswith("#!/bin/bash")
+
+    def test_runctn_function_defined(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "runCtn()" in script
+
+    def test_waitctns_function_defined(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "waitCtns()" in script
+
+    def test_endscript_function_defined(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "endScript()" in script
+
+    def test_highestexitcode_initialized(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "highestExitCode=0" in script
+
+    def test_pidctns_initialized(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert 'pidCtns=""' in script
+
+    def test_workingpath_exported(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "workingPath=$(pwd)" in script
+
+    def test_waitctns_called_at_end(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "waitCtns" in script
+        # The bare "\nwaitCtns\n" call must appear after the runCtn call
+        waitctns_call_pos = script.index("\nwaitCtns\n")
+        assert waitctns_call_pos > script.index("runCtn c1")
+
+    def test_endscript_called_at_end(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "endScript" in script
+        assert script.index("endScript\n") > script.index("waitCtns\n")
+
+
+class TestRunCtnSingleContainer:
+    """Single-container pod still uses runCtn (background execution)."""
+
+    def test_runctn_invocation_present(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        assert "runCtn c1" in script
+
+    def test_runctn_carries_singularity_command(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        assert "runCtn c1 singularity exec docker://busybox:latest sh" in script
+
+    def test_no_direct_singularity_exec_outside_runctn(self):
+        """The singularity exec should only appear inside the runCtn call, not
+        as a bare top-level command."""
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        lines = script.splitlines()
+        bare = [l for l in lines if l.strip().startswith("singularity exec")]
+        assert bare == [], f"Bare singularity exec lines found: {bare}"
+
+
+class TestRunCtnMultiContainer:
+    """Multiple containers each get their own runCtn call; all run in background."""
+
+    def test_both_containers_have_runctn(self):
+        script = _make_script(
+            _TWO_CONTAINERS,
+            [
+                ("c1", ["singularity", "exec", "docker://busybox:latest", "sh"]),
+                ("c2", ["singularity", "exec", "docker://alpine:latest", "sh"]),
+            ],
+        )
+        assert "runCtn c1" in script
+        assert "runCtn c2" in script
+
+    def test_container_order_preserved(self):
+        script = _make_script(
+            _TWO_CONTAINERS,
+            [
+                ("c1", ["singularity", "exec", "docker://busybox:latest", "sh"]),
+                ("c2", ["singularity", "exec", "docker://alpine:latest", "sh"]),
+            ],
+        )
+        assert script.index("runCtn c1") < script.index("runCtn c2")
+
+    def test_waitctns_after_both_runctn_calls(self):
+        script = _make_script(
+            _TWO_CONTAINERS,
+            [
+                ("c1", ["singularity", "exec", "docker://busybox:latest", "sh"]),
+                ("c2", ["singularity", "exec", "docker://alpine:latest", "sh"]),
+            ],
+        )
+        # Find the waitCtns *call* (the bare line "\nwaitCtns\n"), not its
+        # function definition which also contains "waitCtns".
+        waitctns_call_pos = script.index("\nwaitCtns\n")
+        assert waitctns_call_pos > script.index("runCtn c2")
+
+    def test_three_containers(self):
+        containers = [
+            _container("a", "docker://img1:latest"),
+            _container("b", "docker://img2:latest"),
+            _container("c", "docker://img3:latest"),
+        ]
+        commands = [
+            ("a", ["singularity", "exec", "docker://img1:latest"]),
+            ("b", ["singularity", "exec", "docker://img2:latest"]),
+            ("c", ["singularity", "exec", "docker://img3:latest"]),
+        ]
+        script = _make_script(containers, commands)
+        for name in ("a", "b", "c"):
+            assert f"runCtn {name}" in script
+        assert script.index("runCtn a") < script.index("runCtn b") < script.index("runCtn c")
+
+    def test_each_container_gets_correct_image(self):
+        script = _make_script(
+            _TWO_CONTAINERS,
+            [
+                ("c1", ["singularity", "exec", "docker://busybox:latest"]),
+                ("c2", ["singularity", "exec", "docker://alpine:latest"]),
+            ],
+        )
+        assert "runCtn c1 singularity exec docker://busybox:latest" in script
+        assert "runCtn c2 singularity exec docker://alpine:latest" in script
+
+
+class TestRunCtnOutputRedirection:
+    """runCtn redirects output to workingPath/run-<name>.out."""
+
+    def test_runctn_body_redirects_to_workingpath(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert '"${workingPath}/run-${ctn}.out"' in script
+
+    def test_background_ampersand_in_runctn(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        # The & must appear inside the runCtn function body
+        runctn_start = script.index("runCtn()")
+        runctn_end = script.index("waitCtns()")
+        runctn_body = script[runctn_start:runctn_end]
+        assert " &" in runctn_body
+
+    def test_waitctns_writes_status_file(self):
+        script = _make_script(
+            _ONE_CONTAINER,
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+        )
+        assert "run-${ctn}.status" in script
+
+
+class TestRunCtnWithProbes:
+    """Probe cleanup traps appear before helpers; probe sub-shells before runCtn."""
+
+    def test_cleanup_before_runctn_helpers(self):
+        container = _container(
+            "c1", "docker://busybox:latest",
+            livenessProbe={"httpGet": {"port": 8080}},
+        )
+        probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+            probe_scripts=[probe_script],
+            cleanup_scripts=[cleanup_script],
+        )
+        cleanup_pos = script.index("cleanup_probes")
+        helpers_pos = script.index("runCtn()")
+        assert cleanup_pos < helpers_pos
+
+    def test_probe_subshell_before_runctn_call(self):
+        container = _container(
+            "c1", "docker://busybox:latest",
+            livenessProbe={"httpGet": {"port": 8080}},
+        )
+        probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest"])],
+            probe_scripts=[probe_script],
+            cleanup_scripts=[cleanup_script],
+        )
+        probe_pos = script.index("waitForProbes")
+        runctn_call_pos = script.index("runCtn c1")
+        assert probe_pos < runctn_call_pos
+
+
+class TestCleanCommandTokens:
+    """Unit tests for the _clean_command_tokens helper."""
+
+    def test_basic_join(self):
+        result = handles._clean_command_tokens(["singularity", "exec", "image"])
+        assert result == "singularity exec image"
+
+    def test_empty_tokens_removed(self):
+        result = handles._clean_command_tokens(["singularity", '""', "exec", "image"])
+        assert '""' not in result
+
+    def test_c_flag_quotes_next_token(self):
+        result = handles._clean_command_tokens(["sh", "-c", "echo hello"])
+        assert "'echo hello'" in result
+
+    def test_extra_spaces_collapsed(self):
+        result = handles._clean_command_tokens(["a", "", "b"])
+        assert "  " not in result
+
