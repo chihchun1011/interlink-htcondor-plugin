@@ -10,6 +10,12 @@ from datetime import datetime
 import yaml
 from flask import Flask, jsonify, request
 
+from probes import (
+    generate_probe_cleanup_script,
+    generate_probe_script,
+    translate_kubernetes_probes,
+)
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--schedd-name", help="Schedd name", type=str, default="")
@@ -366,6 +372,27 @@ def parse_string_with_suffix(value_str):
         return 1
 
 
+def _is_main_command_line(stripped):
+    """Return True if *stripped* is a non-preamble, non-probe line.
+
+    Used to find the insertion point for the probe sub-shell block: we skip
+    the shebang, blank lines, comment lines, export statements and probe
+    cleanup trap/function lines so that the probe background processes are
+    launched just before the actual singularity exec command.
+    """
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return False
+    if stripped.startswith("export "):
+        return False
+    if "cleanup_probes" in stripped:
+        return False
+    if stripped.startswith("trap "):
+        return False
+    return True
+
+
 def produce_htcondor_singularity_script(containers, metadata, commands, input_files):
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
@@ -407,6 +434,40 @@ def produce_htcondor_singularity_script(containers, metadata, commands, input_fi
     if wstunnel_commands:
         prefix_ += f"\n{wstunnel_commands}\n"
 
+    # Kubernetes probes: collect probe and cleanup scripts for every container
+    singularity_options = annotations.get("slurm-job.vk.io/singularity-options", "")
+    singularity_path = InterLinkConfigInst.get("SingularityPath", "singularity")
+    probe_scripts = []
+    cleanup_scripts = []
+    for c in containers:
+        readiness, liveness, startup = translate_kubernetes_probes(c)
+        if readiness or liveness or startup:
+            image = c.get("image", "")
+            if not (
+                image.startswith("/cvmfs") or image.startswith("docker://")
+            ):
+                image = "docker://" + image
+            opts = singularity_options.split() if singularity_options else []
+            probe_scripts.append(
+                generate_probe_script(
+                    container_name=c["name"],
+                    image_name=image,
+                    readiness_probes=readiness,
+                    liveness_probes=liveness,
+                    startup_probes=startup,
+                    singularity_path=singularity_path,
+                    singularity_options=opts,
+                )
+            )
+            cleanup_scripts.append(
+                generate_probe_cleanup_script(
+                    container_name=c["name"],
+                    readiness_probes=readiness,
+                    liveness_probes=liveness,
+                    startup_probes=startup,
+                )
+            )
+
     try:
         with open(executable_path, "w") as f:
             batch_macros = """#!/bin/bash
@@ -423,7 +484,27 @@ def produce_htcondor_singularity_script(containers, metadata, commands, input_fi
                 c = re.sub(r" {2,}", " ", c)
                 cleaned.append(c.strip())
             commands_joined = cleaned
-            f.write(batch_macros + "\n" + "\n".join(commands_joined))
+
+            script_body = batch_macros + "\n"
+            # Inject cleanup traps immediately after the shebang
+            for cs in cleanup_scripts:
+                script_body += cs + "\n"
+            script_body += "\n".join(commands_joined)
+            # Inject probe sub-shells before the main command block
+            if probe_scripts:
+                probe_block = "\n".join(probe_scripts)
+                # Insert probe block before the first non-empty command line
+                lines = script_body.splitlines(keepends=True)
+                insert_at = len(lines)
+                for idx, line in enumerate(lines):
+                    stripped = line.strip()
+                    # Skip shebang, blank lines, exports, and cleanup traps
+                    if _is_main_command_line(stripped):
+                        insert_at = idx
+                        break
+                lines.insert(insert_at, probe_block + "\n")
+                script_body = "".join(lines)
+            f.write(script_body)
 
         job = f"""
 Executable = {executable_path}
