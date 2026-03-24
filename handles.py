@@ -372,6 +372,54 @@ def parse_string_with_suffix(value_str):
         return 1
 
 
+def prepare_probes(container, metadata):
+    """Translate Kubernetes probe specs for a container into bash script snippets.
+
+    Follows the same prepare-* pattern as prepare_env_file and prepare_mounts.
+    Called once per container inside SubmitHandler; the returned scripts are
+    collected and later passed to produce_htcondor_singularity_script.
+
+    Returns:
+        tuple[str, str]: (probe_script, cleanup_script). Both strings are
+        empty when no probes are defined for the container.
+    """
+    annotations = metadata.get("annotations", {})
+    singularity_options = annotations.get("slurm-job.vk.io/singularity-options", "")
+    singularity_path = InterLinkConfigInst.get("SingularityPath", "singularity")
+
+    readiness, liveness, startup = translate_kubernetes_probes(container)
+
+    if not readiness and not liveness and not startup:
+        return "", ""
+
+    image = container.get("image", "")
+    if not (image.startswith("/cvmfs") or image.startswith("docker://")):
+        image = "docker://" + image
+    opts = singularity_options.split() if singularity_options else []
+
+    probe_script = generate_probe_script(
+        container_name=container["name"],
+        image_name=image,
+        readiness_probes=readiness,
+        liveness_probes=liveness,
+        startup_probes=startup,
+        singularity_path=singularity_path,
+        singularity_options=opts,
+    )
+    cleanup_script = generate_probe_cleanup_script(
+        container_name=container["name"],
+        readiness_probes=readiness,
+        liveness_probes=liveness,
+        startup_probes=startup,
+    )
+
+    logging.info(
+        f"Prepared probes for container {container['name']}: "
+        f"readiness={len(readiness)}, liveness={len(liveness)}, startup={len(startup)}"
+    )
+    return probe_script, cleanup_script
+
+
 def _is_main_command_line(stripped):
     """Return True if *stripped* is a non-preamble, non-probe line.
 
@@ -393,7 +441,33 @@ def _is_main_command_line(stripped):
     return True
 
 
-def produce_htcondor_singularity_script(containers, metadata, commands, input_files):
+def produce_htcondor_singularity_script(
+    containers, metadata, commands, input_files, probe_scripts=None, cleanup_scripts=None
+):
+    """Write the HTCondor job executable and submit description file.
+
+    Parameters
+    ----------
+    containers:
+        List of container dicts from pod["spec"]["containers"].
+    metadata:
+        Pod metadata dict.
+    commands:
+        Flat list of command tokens for the singularity exec call.
+    input_files:
+        Files that HTCondor must transfer to the execute node.
+    probe_scripts:
+        Probe sub-shell snippets produced by prepare_probes(), one per
+        container that defines probes. Pass None (default) for no probes.
+    cleanup_scripts:
+        Cleanup trap snippets produced by prepare_probes(), matching
+        probe_scripts. Pass None (default) for no probes.
+    """
+    if probe_scripts is None:
+        probe_scripts = []
+    if cleanup_scripts is None:
+        cleanup_scripts = []
+
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
@@ -434,39 +508,9 @@ def produce_htcondor_singularity_script(containers, metadata, commands, input_fi
     if wstunnel_commands:
         prefix_ += f"\n{wstunnel_commands}\n"
 
-    # Kubernetes probes: collect probe and cleanup scripts for every container
-    singularity_options = annotations.get("slurm-job.vk.io/singularity-options", "")
-    singularity_path = InterLinkConfigInst.get("SingularityPath", "singularity")
-    probe_scripts = []
-    cleanup_scripts = []
-    for c in containers:
-        readiness, liveness, startup = translate_kubernetes_probes(c)
-        if readiness or liveness or startup:
-            image = c.get("image", "")
-            if not (
-                image.startswith("/cvmfs") or image.startswith("docker://")
-            ):
-                image = "docker://" + image
-            opts = singularity_options.split() if singularity_options else []
-            probe_scripts.append(
-                generate_probe_script(
-                    container_name=c["name"],
-                    image_name=image,
-                    readiness_probes=readiness,
-                    liveness_probes=liveness,
-                    startup_probes=startup,
-                    singularity_path=singularity_path,
-                    singularity_options=opts,
-                )
-            )
-            cleanup_scripts.append(
-                generate_probe_cleanup_script(
-                    container_name=c["name"],
-                    readiness_probes=readiness,
-                    liveness_probes=liveness,
-                    startup_probes=startup,
-                )
-            )
+    # Filter out empty probe/cleanup strings (containers with no probes return "")
+    probe_scripts = [s for s in probe_scripts if s]
+    cleanup_scripts = [s for s in cleanup_scripts if s]
 
     try:
         with open(executable_path, "w") as f:
@@ -674,6 +718,8 @@ def SubmitHandler():
 
     # NORMAL CASE
     if "host" not in containers[0]["image"]:
+        probe_scripts = []
+        cleanup_scripts = []
         for container in containers:
             logging.info(
                 f"Beginning script generation for container {container['name']}"
@@ -742,6 +788,10 @@ def SubmitHandler():
             if local_mounts[-1] == "":
                 local_mounts = [""]
 
+            probe_script, cleanup_script = prepare_probes(container, metadata)
+            probe_scripts.append(probe_script)
+            cleanup_scripts.append(cleanup_script)
+
             if "command" in container.keys() and "args" in container.keys():
                 singularity_command = (
                     [pre_exec]
@@ -780,7 +830,8 @@ def SubmitHandler():
             # print("singularity_command:", singularity_command)
             singularity_commands.append(singularity_command)
         path = produce_htcondor_singularity_script(
-            containers, metadata, singularity_command, input_files
+            containers, metadata, singularity_command, input_files,
+            probe_scripts=probe_scripts, cleanup_scripts=cleanup_scripts,
         )
 
     else:
