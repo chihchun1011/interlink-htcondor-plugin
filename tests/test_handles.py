@@ -592,49 +592,32 @@ def _make_pod(name="test-pod", uid="uid-123", namespace="default", containers=No
 class TestCreateResponseFormat:
     """/create must return HTTP 200 with {PodUID, PodJID} (interlink 0.6.1 contract)."""
 
-    def test_create_returns_200_not_201(self, tmp_path, monkeypatch):
+    def _call_create(self, tmp_path, monkeypatch):
+        """Stub HTCondor dependencies and POST to /create; return the response."""
         monkeypatch.setattr(
             handles,
             "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
+            {"DataRootFolder": str(tmp_path) + "/"},
         )
-        # Stub out the parts that need a real HTCondor installation
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
-        # Create a fake JID file so the handler believes submission succeeded
         (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
-        # Also stub produce_htcondor_singularity_script to avoid file I/O
         monkeypatch.setattr(
             handles,
             "produce_htcondor_singularity_script",
             lambda *a, **kw: str(tmp_path / "fake.jdl"),
         )
         payload = _json.dumps({"pod": _make_pod(), "container": []})
-        client = _flask_test_client()
-        resp = client.post("/create", data=payload, content_type="application/json")
+        return _flask_test_client().post(
+            "/create", data=payload, content_type="application/json"
+        )
+
+    def test_create_returns_200_not_201(self, tmp_path, monkeypatch):
+        resp = self._call_create(tmp_path, monkeypatch)
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
 
     def test_create_response_has_poduid_and_podjid(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
-        monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
-        monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
-        (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
-        monkeypatch.setattr(
-            handles,
-            "produce_htcondor_singularity_script",
-            lambda *a, **kw: str(tmp_path / "fake.jdl"),
-        )
-        payload = _json.dumps({"pod": _make_pod(), "container": []})
-        client = _flask_test_client()
-        resp = client.post("/create", data=payload, content_type="application/json")
+        resp = self._call_create(tmp_path, monkeypatch)
         data = _json.loads(resp.data)
         assert "PodUID" in data
         assert "PodJID" in data
@@ -642,24 +625,7 @@ class TestCreateResponseFormat:
         assert data["PodJID"] == "123.0"
 
     def test_create_response_has_no_extra_metadata_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
-        monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
-        monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
-        (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
-        monkeypatch.setattr(
-            handles,
-            "produce_htcondor_singularity_script",
-            lambda *a, **kw: str(tmp_path / "fake.jdl"),
-        )
-        payload = _json.dumps({"pod": _make_pod(), "container": []})
-        client = _flask_test_client()
-        resp = client.post("/create", data=payload, content_type="application/json")
+        resp = self._call_create(tmp_path, monkeypatch)
         data = _json.loads(resp.data)
         # interlink 0.6.1 CreateStruct only has PodUID and PodJID
         assert "metadata" not in data
@@ -670,6 +636,14 @@ class TestStatusHandlerMultiPod:
 
     def _make_jid_file(self, tmp_path, pod_name, pod_uid, jid):
         (tmp_path / f"{pod_name}-{pod_uid}.jid").write_text(jid)
+
+    def _setup_config(self, tmp_path, monkeypatch):
+        """Patch InterLinkConfigInst to use tmp_path as data root."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
 
     def _fake_condor_output(self, monkeypatch, jid, job_status=2):
         """Patch os.popen so condor_q returns a minimal JSON job record."""
@@ -691,34 +665,25 @@ class TestStatusHandlerMultiPod:
 
         monkeypatch.setattr(os, "popen", fake_popen)
 
-    def test_single_pod_returns_one_status(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
-        self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
-        self._fake_condor_output(monkeypatch, "100.0", job_status=2)
-        pods = [_make_pod("pod-a", "uid-a")]
+    def _get_statuses(self, pods):
+        """POST a /status request and return the parsed JSON list."""
         client = _flask_test_client()
         resp = client.get(
             "/status", data=_json.dumps(pods), content_type="application/json"
         )
         assert resp.status_code == 200
-        statuses = _json.loads(resp.data)
+        return _json.loads(resp.data)
+
+    def test_single_pod_returns_one_status(self, tmp_path, monkeypatch):
+        self._setup_config(tmp_path, monkeypatch)
+        self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
+        self._fake_condor_output(monkeypatch, "100.0", job_status=2)
+        statuses = self._get_statuses([_make_pod("pod-a", "uid-a")])
         assert len(statuses) == 1
         assert statuses[0]["name"] == "pod-a"
 
     def test_multiple_pods_returns_all_statuses(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
+        self._setup_config(tmp_path, monkeypatch)
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._make_jid_file(tmp_path, "pod-b", "uid-b", "101.0")
 
@@ -741,76 +706,37 @@ class TestStatusHandlerMultiPod:
             return FakeProc()
 
         monkeypatch.setattr(os, "popen", fake_popen)
-
         pods = [_make_pod("pod-a", "uid-a"), _make_pod("pod-b", "uid-b")]
-        client = _flask_test_client()
-        resp = client.get(
-            "/status", data=_json.dumps(pods), content_type="application/json"
-        )
-        assert resp.status_code == 200
-        statuses = _json.loads(resp.data)
+        statuses = self._get_statuses(pods)
         assert len(statuses) == 2
         names = {s["name"] for s in statuses}
         assert "pod-a" in names
         assert "pod-b" in names
 
     def test_status_response_has_init_containers_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
+        self._setup_config(tmp_path, monkeypatch)
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
-        pods = [_make_pod("pod-a", "uid-a")]
-        client = _flask_test_client()
-        resp = client.get(
-            "/status", data=_json.dumps(pods), content_type="application/json"
-        )
-        statuses = _json.loads(resp.data)
+        statuses = self._get_statuses([_make_pod("pod-a", "uid-a")])
         assert "initContainers" in statuses[0]
 
     def test_status_response_has_jid_field(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
+        self._setup_config(tmp_path, monkeypatch)
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
-        pods = [_make_pod("pod-a", "uid-a")]
-        client = _flask_test_client()
-        resp = client.get(
-            "/status", data=_json.dumps(pods), content_type="application/json"
-        )
-        statuses = _json.loads(resp.data)
+        statuses = self._get_statuses([_make_pod("pod-a", "uid-a")])
         assert statuses[0]["JID"] == "100.0"
         assert statuses[0]["UID"] == "uid-a"
         assert statuses[0]["namespace"] == "default"
 
     def test_missing_pod_skipped_not_fatal(self, tmp_path, monkeypatch):
         """If one pod's JID file doesn't exist, others still get status."""
-        monkeypatch.setattr(
-            handles,
-            "InterLinkConfigInst",
-            {
-                "DataRootFolder": str(tmp_path) + "/",
-            },
-        )
+        self._setup_config(tmp_path, monkeypatch)
         # Only pod-a has a JID file; pod-b does not
         self._make_jid_file(tmp_path, "pod-a", "uid-a", "100.0")
         self._fake_condor_output(monkeypatch, "100.0", job_status=2)
         pods = [_make_pod("pod-a", "uid-a"), _make_pod("pod-b", "uid-b")]
-        client = _flask_test_client()
-        resp = client.get(
-            "/status", data=_json.dumps(pods), content_type="application/json"
-        )
-        assert resp.status_code == 200
-        statuses = _json.loads(resp.data)
+        statuses = self._get_statuses(pods)
         # Only pod-a should be in the response
         assert len(statuses) == 1
         assert statuses[0]["name"] == "pod-a"
