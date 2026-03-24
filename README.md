@@ -3,7 +3,9 @@
 [![InterLink Compatible](https://img.shields.io/badge/InterLink-v0.5.0+-blue)](https://github.com/interlink-hq/interLink)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 
-This repository contains an InterLink HTCondor sidecar plugin — a container manager that interfaces with [InterLink](https://github.com/interlink-hq/interLink) instances to deploy Kubernetes pod containers on HTCondor batch systems using Singularity/Apptainer.
+This repository contains an InterLink HTCondor sidecar plugin — a container manager that interfaces with
+[InterLink](https://github.com/interlink-hq/interLink) instances to deploy Kubernetes pod containers on
+HTCondor batch systems using Singularity/Apptainer.
 
 ## Features
 
@@ -26,12 +28,14 @@ Before you begin, make sure you have the following installed and configured:
 |---|---|
 | Python 3.6+ | `python3 --version` |
 | `pip` | `pip3 --version` |
-| HTCondor CLI tools | `condor_submit`, `condor_q`, `condor_rm` must be on your `$PATH` |
+| HTCondor command-line tools | `condor_submit`, `condor_q`, `condor_rm` must be on your `$PATH` |
 | Singularity or Apptainer | Required to pull and run container images |
 | Grid proxy certificate | Only for GSI authentication — run `voms-proxy-init` or `grid-proxy-init` |
 | `curl` | For the quick test below |
 
-> **Tip for beginners:** If you only want to verify that the plugin server starts and its REST API is reachable — without a real HTCondor cluster — you can still follow every step here. The `/status` health-check and the request-validation logic work without an active scheduler.
+> **Tip for beginners:** If you only want to verify that the plugin server starts and its REST API is
+> reachable — without a real HTCondor cluster — you can still follow every step here.
+> The `/status` health-check and the request-validation logic work without an active scheduler.
 
 ---
 
@@ -77,7 +81,8 @@ python3 handles.py \
   --port           4000
 ```
 
-> **No authentication needed for local / development setups.** If your HTCondor pool uses `CLAIMTOBE` or no authentication, no extra flags are required.
+> **No authentication needed for local / development setups.**
+> If your HTCondor pool uses `CLAIMTOBE` or no authentication, no extra flags are required.
 
 **All available flags:**
 
@@ -98,8 +103,7 @@ python3 handles.py \
 
 Once running you should see output similar to:
 
-```
-Interlink configuration info: {'CommandPrefix': '', 'ExportPodData': True, 'DataRootFolder': '.interlink/'}
+```text
  * Running on http://0.0.0.0:4000
 ```
 
@@ -139,7 +143,8 @@ Expected response (healthy):
 
 #### 4b — Submit a test pod (`POST /create`)
 
-The request body follows the InterLink API v0.5.0+ **CreateStruct** format: a `pod` object (standard Kubernetes pod spec) and an optional `container` array with resolved volumes.
+The request body follows the InterLink API v0.5.0+ **CreateStruct** format: a `pod` object
+(standard Kubernetes pod spec) and an optional `container` array with resolved volumes.
 
 ```bash
 curl -s -X POST http://localhost:4000/create \
@@ -185,7 +190,8 @@ On success (HTTP 201) the plugin returns the HTCondor cluster job ID:
 }
 ```
 
-> **Note:** The `PodJID` value (`12345` in the example) is the HTCondor cluster ID. You can verify the job with `condor_q 12345`.
+> **Note:** The `PodJID` value (`12345` in the example) is the HTCondor cluster ID.
+> You can verify the job with `condor_q 12345`.
 
 #### 4c — Check pod status (`GET /status`)
 
@@ -272,7 +278,8 @@ Expected response (HTTP 200):
 To set up a full InterLink deployment with a Virtual Kubelet node, follow the official guide:
 👉 **[InterLink in-cluster setup](https://interlink-project.dev/docs/cookbook/incluster)**
 
-Once your Virtual Kubelet node is registered and ready, you can test end-to-end by applying the manifests in the `tests/` directory:
+Once your Virtual Kubelet node is registered and ready, you can test end-to-end by applying the
+manifests in the `tests/` directory:
 
 ```bash
 # Apply supporting resources first
@@ -290,7 +297,10 @@ The test pod runs `sleep 10` inside a `busybox` Singularity container and mounts
 
 #### Host-based script execution
 
-A special execution mode is triggered when the container image name starts with the literal string `host`. In that case the plugin extracts the script from the container arguments and submits it directly — bypassing Singularity entirely. This is useful for site-specific scripts that must run in the host environment:
+A special execution mode is triggered when the container image name starts with the literal string
+`host`. In that case the plugin extracts the script from the container arguments and submits it
+directly — bypassing Singularity entirely. This is useful for site-specific scripts that must run
+in the host environment:
 
 ```bash
 kubectl apply -f ./tests/production_deployment_LNL.yaml
@@ -332,7 +342,9 @@ Inside the container the plugin starts automatically (`python3 handles.py`) alon
 
 ## Appendix: Authentication
 
-By default the plugin connects to HTCondor without any special authentication (suitable for local or development clusters). For production deployments that require authentication, pass `--auth-method` and the relevant credential flags.
+By default the plugin connects to HTCondor without any special authentication (suitable for local or
+development clusters). For production deployments that require authentication, pass `--auth-method`
+and the relevant credential flags.
 
 ### GSI (X.509 proxy certificates)
 
@@ -345,7 +357,8 @@ python3 handles.py \
   --port           4000
 ```
 
-Certificates must be in `/etc/grid-security/certificates` and a valid proxy must exist at the path provided to `--proxy`. Generate a proxy with:
+Certificates must be in `/etc/grid-security/certificates` and a valid proxy must exist at the path
+provided to `--proxy`. Generate a proxy with:
 
 ```bash
 voms-proxy-init --voms <your-vo>
