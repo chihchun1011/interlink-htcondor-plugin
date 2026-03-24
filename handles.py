@@ -9,7 +9,6 @@ from datetime import datetime
 
 import yaml
 from flask import Flask, jsonify, request
-
 from probes import (
     generate_probe_cleanup_script,
     generate_probe_script,
@@ -652,7 +651,9 @@ def produce_htcondor_host_script(container, metadata):
     try:
         with open(executable_path, "w") as f:
             batch_macros = f"""#!{container['command'][-1]}
-""" + "\n".join(container["args"][-1].split("; "))
+""" + "\n".join(
+                container["args"][-1].split("; ")
+            )
 
             f.write(batch_macros)
 

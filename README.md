@@ -10,10 +10,13 @@ HTCondor batch systems using Singularity/Apptainer.
 ## Features
 
 - **Full Kubernetes Pod Support**: Handles containers, volumes, secrets, configMaps, and resource requests
-- **Multi-Container Pods**: All containers in a pod run concurrently via the `runCtn`/`waitCtns`/`endScript` pattern; each container runs in the background and the job exits with the highest exit code
-- **Kubernetes Probe Support**: Translates `livenessProbe`, `readinessProbe`, and `startupProbe` specs to bash scripts; supports `httpGet` (curl-based) and `exec` (Singularity exec) probe types
+- **Multi-Container Pods**: All containers in a pod run concurrently via the `runCtn`/`waitCtns`/`endScript`
+  pattern; each container runs in the background and the job exits with the highest exit code
+- **Kubernetes Probe Support**: Translates `livenessProbe`, `readinessProbe`, and `startupProbe` specs to
+  bash scripts; supports `httpGet` (curl-based) and `exec` (Singularity exec) probe types
 - **Dual Execution Modes**: Singularity containers and host-based script execution
-- **InterLink API v0.6.1+ Compatible**: Correct HTTP status codes, multi-pod `/status` responses, and `initContainers` field matching the `PodStatus` type
+- **InterLink API v0.6.1+ Compatible**: Correct HTTP status codes, multi-pod `/status` responses, and
+  `initContainers` field matching the `PodStatus` type
 - **HTCondor Health Check**: `/system-info` endpoint reports cluster connectivity via `condor_status -totals`
 - **Comprehensive Logging**: Aggregated stdout, stderr, and HTCondor job logs
 - **Real-time Status**: Live job status with actual timestamps from HTCondor
