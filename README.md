@@ -52,33 +52,32 @@ pip3 install flask pyyaml
 Open [`SidecarConfig.yaml`](SidecarConfig.yaml) and adjust the values to your environment:
 
 ```yaml
-CommandPrefix: ""        # Optional shell prefix prepended to every job command
-                         # e.g. "source /cvmfs/cms.cern.ch/cmsset_default.sh;"
-ExportPodData: true      # Mount ConfigMaps and Secrets into the Singularity job
-DataRootFolder: ".knoc/" # Directory used to store job scripts and tracking files
+CommandPrefix: ""            # Optional shell prefix prepended to every job command
+                             # e.g. "source /cvmfs/cms.cern.ch/cmsset_default.sh;"
+ExportPodData: true          # Mount ConfigMaps and Secrets into the Singularity job
+DataRootFolder: ".interlink/" # Directory used to store job scripts and tracking files
 ```
 
 Create the directories expected by HTCondor and the plugin:
 
 ```bash
-mkdir -p .knoc out err log
+mkdir -p .interlink out err log
 ```
 
 ---
 
 ### 3 — Start the plugin server
 
-The plugin exposes a small Flask HTTP server. The command-line arguments control how it connects to your HTCondor cluster.
+The plugin exposes a small Flask HTTP server. The simplest way to start it — no authentication required — is:
 
 ```bash
 python3 handles.py \
-  --condor-config /path/to/condor_config \
-  --schedd-host   scheduler.example.com \
+  --schedd-host    scheduler.example.com \
   --collector-host collector.example.com \
-  --auth-method   GSI \
-  --proxy         /tmp/x509up_u$(id -u) \
-  --port          4000
+  --port           4000
 ```
+
+> **No authentication needed for local / development setups.** If your HTCondor pool uses `CLAIMTOBE` or no authentication, no extra flags are required.
 
 **All available flags:**
 
@@ -89,8 +88,8 @@ python3 handles.py \
 | `--schedd-name` | HTCondor schedd name | _(empty)_ |
 | `--collector-host` | Hostname of the HTCondor collector | _(empty)_ |
 | `--condor-config` | Path to a custom `condor_config` file | _(empty)_ |
-| `--auth-method` | HTCondor authentication method (e.g. `GSI`, `SSL`) | _(empty)_ |
-| `--proxy` | Path to the X.509 proxy / certificate file | _(empty)_ |
+| `--auth-method` | HTCondor authentication method (e.g. `GSI`, `SCITOKENS`) | _(empty)_ |
+| `--proxy` | Path to the X.509 proxy / SciToken file | _(empty)_ |
 | `--cadir` | Directory with trusted CA certificates | _(empty)_ |
 | `--certfile` | Path to the SSL client certificate | _(empty)_ |
 | `--keyfile` | Path to the SSL private key | _(empty)_ |
@@ -100,7 +99,7 @@ python3 handles.py \
 Once running you should see output similar to:
 
 ```
-Interlink configuration info: {'CommandPrefix': '', 'ExportPodData': True, 'DataRootFolder': '.knoc/'}
+Interlink configuration info: {'CommandPrefix': '', 'ExportPodData': True, 'DataRootFolder': '.interlink/'}
  * Running on http://0.0.0.0:4000
 ```
 
@@ -270,7 +269,10 @@ Expected response (HTTP 200):
 
 ### 5 — Test with Kubernetes (requires InterLink + Virtual Kubelet)
 
-If you have a full InterLink deployment with a Virtual Kubelet node, you can test end-to-end by applying the manifests in the `tests/` directory:
+To set up a full InterLink deployment with a Virtual Kubelet node, follow the official guide:
+👉 **[InterLink in-cluster setup](https://interlink-project.dev/docs/cookbook/incluster)**
+
+Once your Virtual Kubelet node is registered and ready, you can test end-to-end by applying the manifests in the `tests/` directory:
 
 ```bash
 # Apply supporting resources first
@@ -320,21 +322,62 @@ Inside the container the plugin starts automatically (`python3 handles.py`) alon
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `condor_submit: command not found` | HTCondor CLI not on `$PATH` | Install HTCondor or add its `bin/` to `$PATH` |
-| HTTP 503 on health check | Proxy file missing or expired | Run `voms-proxy-init` and pass `--proxy` to the server |
+| HTTP 503 on health check | Proxy file missing or expired | For GSI: run `voms-proxy-init`; for SciTokens: refresh the JWT. Pass the path via `--proxy` |
 | HTTP 500 on `/create` | Job submission to HTCondor failed | Check `err/` and `log/` directories for HTCondor error output |
-| `FileNotFoundError: .knoc/…` | Required directories missing | Run `mkdir -p .knoc out err log` |
+| `FileNotFoundError: .interlink/…` | Required directories missing | Run `mkdir -p .interlink out err log` |
 | Pod stuck in `ContainerCreating` | HTCondor job is queued (Idle) | Run `condor_q` to inspect the queue; check for hold reasons |
 | Flask import error | Python dependencies not installed | Run `pip3 install flask pyyaml` |
 
 ---
 
-## Authentication
+## Appendix: Authentication
 
-The plugin supports multiple HTCondor authentication methods via the `--auth-method` flag:
+By default the plugin connects to HTCondor without any special authentication (suitable for local or development clusters). For production deployments that require authentication, pass `--auth-method` and the relevant credential flags.
 
-- **GSI** — X.509 proxy certificates. Certificates must be in `/etc/grid-security/certificates` and a valid proxy must exist at the path provided to `--proxy`.
-- **SSL** — Provide `--certfile`, `--keyfile`, and optionally `--cadir`.
-- **None / CLAIMTOBE** — For local or development setups that do not require strong authentication.
+### GSI (X.509 proxy certificates)
+
+```bash
+python3 handles.py \
+  --schedd-host    scheduler.example.com \
+  --collector-host collector.example.com \
+  --auth-method    GSI \
+  --proxy          /tmp/x509up_u$(id -u) \
+  --port           4000
+```
+
+Certificates must be in `/etc/grid-security/certificates` and a valid proxy must exist at the path provided to `--proxy`. Generate a proxy with:
+
+```bash
+voms-proxy-init --voms <your-vo>
+# or
+grid-proxy-init
+```
+
+### SciTokens
+
+```bash
+python3 handles.py \
+  --schedd-host    scheduler.example.com \
+  --collector-host collector.example.com \
+  --auth-method    SCITOKENS \
+  --proxy          /path/to/scitoken.jwt \
+  --port           4000
+```
+
+Pass the SciToken JWT file via `--proxy`.
+
+### SSL (mutual TLS)
+
+```bash
+python3 handles.py \
+  --schedd-host    scheduler.example.com \
+  --collector-host collector.example.com \
+  --auth-method    SSL \
+  --certfile       /path/to/client.crt \
+  --keyfile        /path/to/client.key \
+  --cadir          /etc/grid-security/certificates \
+  --port           4000
+```
 
 ---
 
