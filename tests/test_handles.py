@@ -514,7 +514,7 @@ class TestRunCtnWithProbes:
     """Probe cleanup traps appear before helpers; probe sub-shells before runCtn."""
 
     def _make_probe_script(self):
-        """Return (probe_script, cleanup_script) for a container with a liveness probe."""
+        """Build probe_script and cleanup_script for a liveness probe container."""
         container = _container(
             "c1",
             "docker://busybox:latest",
