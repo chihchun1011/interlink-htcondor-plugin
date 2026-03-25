@@ -9,6 +9,11 @@ from datetime import datetime
 
 import yaml
 from flask import Flask, jsonify, request
+from probes import (
+    generate_probe_cleanup_script,
+    generate_probe_script,
+    translate_kubernetes_probes,
+)
 
 parser = argparse.ArgumentParser()
 
@@ -366,7 +371,170 @@ def parse_string_with_suffix(value_str):
         return 1
 
 
-def produce_htcondor_singularity_script(containers, metadata, commands, input_files):
+def prepare_probes(container, metadata):
+    """Translate Kubernetes probe specs for a container into bash script snippets.
+
+    Follows the same prepare-* pattern as prepare_env_file and prepare_mounts.
+    Called once per container inside SubmitHandler; the returned scripts are
+    collected and later passed to produce_htcondor_singularity_script.
+
+    Returns:
+        tuple[str, str]: (probe_script, cleanup_script). Both strings are
+        empty when no probes are defined for the container.
+    """
+    annotations = metadata.get("annotations", {})
+    singularity_options = annotations.get("slurm-job.vk.io/singularity-options", "")
+    singularity_path = InterLinkConfigInst.get("SingularityPath", "singularity")
+
+    readiness, liveness, startup = translate_kubernetes_probes(container)
+
+    if not readiness and not liveness and not startup:
+        return "", ""
+
+    image = container.get("image", "")
+    if not (image.startswith("/cvmfs") or image.startswith("docker://")):
+        image = "docker://" + image
+    opts = singularity_options.split() if singularity_options else []
+
+    probe_script = generate_probe_script(
+        container_name=container["name"],
+        image_name=image,
+        readiness_probes=readiness,
+        liveness_probes=liveness,
+        startup_probes=startup,
+        singularity_path=singularity_path,
+        singularity_options=opts,
+    )
+    cleanup_script = generate_probe_cleanup_script(
+        container_name=container["name"],
+        readiness_probes=readiness,
+        liveness_probes=liveness,
+        startup_probes=startup,
+    )
+
+    logging.info(
+        f"Prepared probes for container {container['name']}: "
+        f"readiness={len(readiness)}, liveness={len(liveness)}, startup={len(startup)}"
+    )
+    return probe_script, cleanup_script
+
+
+def _is_main_command_line(stripped):
+    """Return True if *stripped* is a non-preamble, non-probe line.
+
+    Used to find the insertion point for the probe sub-shell block: we skip
+    the shebang, blank lines, comment lines, export statements and probe
+    cleanup trap/function lines so that the probe background processes are
+    launched just before the actual singularity exec command.
+    """
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return False
+    if stripped.startswith("export "):
+        return False
+    if "cleanup_probes" in stripped:
+        return False
+    if stripped.startswith("trap "):
+        return False
+    return True
+
+
+# Bash helper functions injected into every multi-container job script.
+# These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
+# each Singularity container runs in the background and all exit codes are
+# collected before the job terminates.
+_RUN_CTN_HELPERS = r"""
+runCtn() {
+  local ctn="$1"
+  shift
+  ( "$@" ) > "${workingPath}/run-${ctn}.out" 2>&1 &
+  local pid="$!"
+  printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
+  pidCtns="${pidCtns} ${pid}:${ctn}"
+}
+
+waitCtns() {
+  for pidCtn in ${pidCtns}; do
+    local pid="${pidCtn%:*}"
+    local ctn="${pidCtn#*:}"
+    printf '%s\n' "$(date -Is --utc) Waiting for ${ctn} (pid ${pid})..."
+    wait "${pid}"
+    local exitCode="$?"
+    printf '%s\n' "${exitCode}" > "${workingPath}/run-${ctn}.status"
+    printf '%s\n' "$(date -Is --utc) ${ctn} ended with status ${exitCode}."
+  done
+  for filestatus in "${workingPath}"/*.status; do
+    [ -f "$filestatus" ] || continue
+    local exitCode
+    exitCode=$(cat "$filestatus")
+    [ "${highestExitCode}" -lt "${exitCode}" ] && highestExitCode="${exitCode}"
+  done
+}
+
+endScript() {
+  printf '%s\n' "$(date -Is --utc) End of script, exit: ${highestExitCode}."
+  exit "${highestExitCode}"
+}
+"""
+
+
+def _clean_command_tokens(tokens):
+    """Join and clean a list of singularity command tokens into a single string.
+
+    Wraps the token that follows a ``-c`` flag in single quotes (so the shell
+    does not re-split it), then strips empty double-quoted tokens and collapses
+    extra whitespace.
+    """
+    result = list(tokens)
+    for i in range(1, len(result)):
+        if result[i - 1] == "-c":
+            result[i] = "'" + result[i] + "'"
+    line = " ".join(result)
+    line = re.sub(r'\s*""\s*', " ", line)
+    line = re.sub(r" {2,}", " ", line)
+    return line.strip()
+
+
+def produce_htcondor_singularity_script(
+    containers,
+    metadata,
+    container_commands,
+    input_files,
+    probe_scripts=None,
+    cleanup_scripts=None,
+):
+    """Write the HTCondor job executable and submit description file.
+
+    Each container is launched in the background via a ``runCtn()`` bash
+    helper, mirroring the SLURM plugin's pattern.  ``waitCtns()`` collects
+    all exit codes, and ``endScript()`` exits with the highest one.
+
+    Parameters
+    ----------
+    containers:
+        List of container dicts from pod["spec"]["containers"].
+    metadata:
+        Pod metadata dict.
+    container_commands:
+        List of ``(container_name, [cmd_tokens])`` tuples, one per container,
+        in the order they should be launched.  Each entry is produced by the
+        SubmitHandler container loop.
+    input_files:
+        Files that HTCondor must transfer to the execute node (deduplicated
+        across all containers by the caller).
+    probe_scripts:
+        Probe sub-shell snippets produced by prepare_probes(), one per
+        container that defines probes.  Pass None (default) for no probes.
+    cleanup_scripts:
+        Cleanup trap snippets produced by prepare_probes(), matching
+        probe_scripts.  Pass None (default) for no probes.
+    """
+    if probe_scripts is None:
+        probe_scripts = []
+    if cleanup_scripts is None:
+        cleanup_scripts = []
+
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
@@ -407,23 +575,43 @@ def produce_htcondor_singularity_script(containers, metadata, commands, input_fi
     if wstunnel_commands:
         prefix_ += f"\n{wstunnel_commands}\n"
 
+    # Filter out empty probe/cleanup strings (containers with no probes return "")
+    probe_scripts = [s for s in probe_scripts if s]
+    cleanup_scripts = [s for s in cleanup_scripts if s]
+
     try:
         with open(executable_path, "w") as f:
-            batch_macros = """#!/bin/bash
-"""
-            commands_joined = [prefix_]
-            for i in range(0, len(commands)):
-                if i > 0:
-                    if "-c" in commands[i - 1]:
-                        commands[i] = "'" + commands[i] + "'"
-            commands_joined.append(" ".join(commands))
-            cleaned = []
-            for cmd in commands_joined:
-                c = re.sub(r'\s*""\s*', " ", cmd)
-                c = re.sub(r" {2,}", " ", c)
-                cleaned.append(c.strip())
-            commands_joined = cleaned
-            f.write(batch_macros + "\n" + "\n".join(commands_joined))
+            # ---- shebang ------------------------------------------------
+            script_body = "#!/bin/bash\n"
+
+            # ---- probe cleanup traps (must be defined before any trap) --
+            for cs in cleanup_scripts:
+                script_body += "\n" + cs + "\n"
+
+            # ---- runCtn / waitCtns / endScript helpers ------------------
+            script_body += _RUN_CTN_HELPERS
+
+            # ---- preamble (exports, wstunnel, command prefix, etc.) -----
+            if prefix_.strip():
+                script_body += "\n" + prefix_.strip() + "\n"
+
+            # ---- probe background sub-shells ----------------------------
+            for ps in probe_scripts:
+                script_body += "\n" + ps + "\n"
+
+            # ---- main: run every container in background ----------------
+            script_body += "\nhighestExitCode=0\n"
+            script_body += 'pidCtns=""\n'
+            script_body += "export workingPath=$(pwd)\n\n"
+
+            for ctn_name, cmd_tokens in container_commands:
+                cleaned = _clean_command_tokens(cmd_tokens)
+                script_body += f"runCtn {ctn_name} {cleaned}\n"
+
+            # ---- wait for all containers and exit -----------------------
+            script_body += "\nwaitCtns\nendScript\n"
+
+            f.write(script_body)
 
         job = f"""
 Executable = {executable_path}
@@ -589,10 +777,18 @@ def SubmitHandler():
     # print("Requested pod metadata name is: ", pod["metadata"]["name"])
     metadata = pod.get("metadata", {})
     containers = pod.get("spec", {}).get("containers", [])
-    singularity_commands = []
 
     # NORMAL CASE
     if "host" not in containers[0]["image"]:
+        probe_scripts = []
+        cleanup_scripts = []
+        # container_commands collects (name, [tokens]) tuples for every container,
+        # mirroring the SLURM plugin's runCtn pattern.
+        container_commands = []
+        # all_input_files is accumulated across all containers (deduped via seen set)
+        all_input_files = []
+        seen_input_files = set()
+
         for container in containers:
             logging.info(
                 f"Beginning script generation for container {container['name']}"
@@ -639,12 +835,15 @@ def SubmitHandler():
                 image = "docker://" + container["image"]
             # image = container["image"]
             logging.info("Appending all commands together...")
-            input_files = []
             for mount in mounts[-1].split(","):
                 if "/cvmfs" not in mount:
-                    input_files.append(mount.split(":")[0])
-                if env_path:
-                    input_files.append(env_path)
+                    mount_src = mount.split(":")[0]
+                    if mount_src and mount_src not in seen_input_files:
+                        all_input_files.append(mount_src)
+                        seen_input_files.add(mount_src)
+                if env_path and env_path not in seen_input_files:
+                    all_input_files.append(env_path)
+                    seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
                 if "/cvmfs" not in mount:
@@ -660,6 +859,10 @@ def SubmitHandler():
                 )
             if local_mounts[-1] == "":
                 local_mounts = [""]
+
+            probe_script, cleanup_script = prepare_probes(container, metadata)
+            probe_scripts.append(probe_script)
+            cleanup_scripts.append(cleanup_script)
 
             if "command" in container.keys() and "args" in container.keys():
                 singularity_command = (
@@ -696,10 +899,16 @@ def SubmitHandler():
                 singularity_command = (
                     [pre_exec] + commstr1 + env_flags + local_mounts + [image]
                 )
-            # print("singularity_command:", singularity_command)
-            singularity_commands.append(singularity_command)
+            # Collect as (name, tokens) for runCtn pattern
+            container_commands.append((container["name"], singularity_command))
+
         path = produce_htcondor_singularity_script(
-            containers, metadata, singularity_command, input_files
+            containers,
+            metadata,
+            container_commands,
+            all_input_files,
+            probe_scripts=probe_scripts,
+            cleanup_scripts=cleanup_scripts,
         )
 
     else:
@@ -727,13 +936,8 @@ def SubmitHandler():
         resp = {
             "PodUID": pod["metadata"]["uid"],
             "PodJID": str(out_jid),
-            "metadata": {
-                "name": pod["metadata"]["name"],
-                "namespace": pod["metadata"].get("namespace", "default"),
-                "uid": pod["metadata"]["uid"],
-            },
         }
-        return success_response(resp, 201)
+        return success_response(resp, 200)
     except Exception as e:
         logging.error(f"Job submission failed: {e}")
         return error_response(f"Job submission failed: {str(e)}", 500)
@@ -801,12 +1005,12 @@ def StatusHandler():
             return error_response("Status request must be an array", 400)
         if len(req_list) == 0:
             return error_response("Empty request array", 400)
-        req = req_list[0]
-        # Validate request structure
-        is_valid, validation_message = validate_pod_request(req)
-        if not is_valid:
-            logging.error(f"Invalid status request: {validation_message}")
-            return error_response(f"Invalid request: {validation_message}", 400)
+        # Validate every pod in the list up-front
+        for req in req_list:
+            is_valid, validation_message = validate_pod_request(req)
+            if not is_valid:
+                logging.error(f"Invalid status request: {validation_message}")
+                return error_response(f"Invalid request: {validation_message}", 400)
     except json.JSONDecodeError as e:
         logging.error(f"Invalid JSON in status request: {e}")
         return error_response("Invalid JSON format", 400)
@@ -814,121 +1018,130 @@ def StatusHandler():
         logging.error(f"Error processing status request: {e}")
         return error_response("Error processing request", 400)
 
-    # ELABORATE RESPONSE #################
-    try:
-        jid_file = (
-            InterLinkConfigInst["DataRootFolder"]
-            + req["metadata"]["name"]
-            + "-"
-            + req["metadata"]["uid"]
-            + ".jid"
-        )
-        with open(jid_file, "r") as f:
-            jid_job = f.read().strip()
-        podname = req["metadata"]["name"]
-        podnamespace = req["metadata"].get("namespace", "default")
-        poduid = req["metadata"]["uid"]
-        # Query HTCondor for job status
-        process = os.popen(f"condor_q {jid_job} --json")
-        preprocessed = process.read()
-        process.close()
-        if not preprocessed.strip():
-            # Job not found in queue, check history
-            process = os.popen(f"condor_history {jid_job} --json")
+    # ELABORATE RESPONSE — process ALL pods in the list #################
+    resp = []
+    for req in req_list:
+        try:
+            jid_file = (
+                InterLinkConfigInst["DataRootFolder"]
+                + req["metadata"]["name"]
+                + "-"
+                + req["metadata"]["uid"]
+                + ".jid"
+            )
+            with open(jid_file, "r") as f:
+                jid_job = f.read().strip()
+            podname = req["metadata"]["name"]
+            podnamespace = req["metadata"].get("namespace", "default")
+            poduid = req["metadata"]["uid"]
+            # Query HTCondor for job status
+            process = os.popen(f"condor_q {jid_job} --json")
             preprocessed = process.read()
             process.close()
-        if not preprocessed.strip():
-            return error_response(
-                f"Job {jid_job} not found in HTCondor queue or history", 404
+            if not preprocessed.strip():
+                # Job not found in queue, check history
+                process = os.popen(f"condor_history {jid_job} --json")
+                preprocessed = process.read()
+                process.close()
+            if not preprocessed.strip():
+                logging.error(f"Job {jid_job} not found in HTCondor queue or history")
+                continue
+            job_data = json.loads(preprocessed)
+            if not job_data:
+                logging.error(f"No job data found for job {jid_job}")
+                continue
+            job = job_data[0]
+            status = job.get("JobStatus", 0)
+            # Get actual timestamps from HTCondor
+            current_time = datetime.utcnow().isoformat() + "Z"
+            start_time = (
+                datetime.fromtimestamp(job.get("JobStartDate", 0)).isoformat() + "Z"
+                if job.get("JobStartDate")
+                else current_time
             )
-        job_data = json.loads(preprocessed)
-        if not job_data:
-            return error_response(f"No job data found for job {jid_job}", 404)
-        job = job_data[0]
-        status = job.get("JobStatus", 0)
-        # Get actual timestamps from HTCondor
-        current_time = datetime.utcnow().isoformat() + "Z"
-        start_time = (
-            datetime.fromtimestamp(job.get("JobStartDate", 0)).isoformat() + "Z"
-            if job.get("JobStartDate")
-            else current_time
-        )
-        completion_time = (
-            datetime.fromtimestamp(job.get("CompletionDate", 0)).isoformat() + "Z"
-            if job.get("CompletionDate")
-            else current_time
-        )
-        # Map HTCondor status to Kubernetes container states
-        if status == 1:  # Idle
-            state = {"waiting": {"reason": "ContainerCreating"}}
-            readiness = False
-        elif status == 2:  # Running
-            state = {"running": {"startedAt": start_time}}
-            readiness = True
-        elif status == 4:  # Completed
-            state = {
-                "terminated": {
-                    "startedAt": start_time,
-                    "finishedAt": completion_time,
-                    "exitCode": job.get("ExitCode", 0),
-                    "reason": "Completed",
+            completion_time = (
+                datetime.fromtimestamp(job.get("CompletionDate", 0)).isoformat() + "Z"
+                if job.get("CompletionDate")
+                else current_time
+            )
+            # Map HTCondor status to Kubernetes container states
+            if status == 1:  # Idle
+                state = {"waiting": {"reason": "ContainerCreating"}}
+                readiness = False
+            elif status == 2:  # Running
+                state = {"running": {"startedAt": start_time}}
+                readiness = True
+            elif status == 4:  # Completed
+                state = {
+                    "terminated": {
+                        "startedAt": start_time,
+                        "finishedAt": completion_time,
+                        "exitCode": job.get("ExitCode", 0),
+                        "reason": "Completed",
+                    }
                 }
-            }
-            readiness = False
-        elif status == 3:  # Removed
-            state = {
-                "terminated": {
-                    "startedAt": start_time,
-                    "finishedAt": completion_time,
-                    "reason": "Cancelled",
+                readiness = False
+            elif status == 3:  # Removed
+                state = {
+                    "terminated": {
+                        "startedAt": start_time,
+                        "finishedAt": completion_time,
+                        "reason": "Cancelled",
+                    }
                 }
-            }
-            readiness = False
-        elif status == 5:  # Held
-            state = {
-                "waiting": {
-                    "reason": "JobHeld",
-                    "message": job.get("HoldReason", "Job held by HTCondor"),
+                readiness = False
+            elif status == 5:  # Held
+                state = {
+                    "waiting": {
+                        "reason": "JobHeld",
+                        "message": job.get("HoldReason", "Job held by HTCondor"),
+                    }
                 }
-            }
-            readiness = False
-        else:
-            state = {"waiting": {"reason": "Unknown"}}
-            readiness = False
-        # Build container status list
-        containers = []
-        for c in req["spec"]["containers"]:
-            containers.append(
+                readiness = False
+            else:
+                state = {"waiting": {"reason": "Unknown"}}
+                readiness = False
+            # Build container status list
+            containers = []
+            for c in req["spec"]["containers"]:
+                containers.append(
+                    {
+                        "name": c["name"],
+                        "state": state,
+                        "lastState": {},
+                        "ready": readiness,
+                        "restartCount": 0,
+                        "image": c.get("image", "unknown"),
+                        "imageID": c.get("image", "unknown"),
+                    }
+                )
+            resp.append(
                 {
-                    "name": c["name"],
-                    "state": state,
-                    "lastState": {},
-                    "ready": readiness,
-                    "restartCount": 0,
-                    "image": c.get("image", "unknown"),
-                    "imageID": c.get("image", "unknown"),
+                    "name": podname,
+                    "UID": poduid,
+                    "namespace": podnamespace,
+                    "JID": jid_job,
+                    "containers": containers,
+                    "initContainers": [],
                 }
             )
-        # Build response in expected format
-        resp = [
-            {
-                "name": podname,
-                "UID": poduid,
-                "namespace": podnamespace,
-                "JID": jid_job,
-                "containers": containers,
-            }
-        ]
-        return success_response(resp, 200)
-    except FileNotFoundError as e:
-        logging.error(f"Job file not found: {e}")
-        return error_response("Pod not found", 404)
-    except json.JSONDecodeError as e:
-        logging.error(f"Error parsing HTCondor response: {e}")
-        return error_response("Error parsing job status", 500)
-    except Exception as e:
-        logging.error(f"Error retrieving pod status: {e}")
-        return error_response(f"Status retrieval failed: {str(e)}", 500)
+        except FileNotFoundError:
+            logging.error(
+                f"Job file not found for pod {req['metadata'].get('name', '?')}"
+            )
+        except json.JSONDecodeError as e:
+            logging.error(
+                "Error parsing HTCondor response for pod %s: %s",
+                req["metadata"].get("name", "?"),
+                e,
+            )
+        except Exception as e:
+            logging.error(
+                "Error retrieving status for pod %s: %s",
+                req["metadata"].get("name", "?"),
+                e,
+            )
+    return success_response(resp, 200)
 
 
 def LogsHandler():
@@ -946,11 +1159,50 @@ def LogsHandler():
     return json.dumps(resp), 200
 
 
+def SystemInfoHandler():
+    """Health-check endpoint that reports HTCondor connectivity.
+
+    Mirrors the /system-info endpoint in the SLURM plugin (see
+    pkg/slurm/SystemInfo.go), adapted for HTCondor: runs ``condor_status -totals``
+    to verify the schedd/collector is reachable and returns a JSON payload
+    with status, timestamp, and the condensed condor_status output.
+    """
+    logging.info("HTCondor Sidecar: received SystemInfo call")
+
+    response = {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "htcondor_connected": False,
+    }
+
+    try:
+        process = os.popen("condor_status -totals 2>&1")
+        output = process.read()
+        process.close()
+        if "TotalMachines" in output or "Machines" in output or "Slots" in output:
+            response["htcondor_connected"] = True
+            response["condor_status_output"] = output.strip()
+        else:
+            # condor_status ran but returned unexpected output — treat as warning
+            response["status"] = "warning"
+            response["htcondor_connected"] = False
+            response["error"] = "condor_status returned unexpected output"
+            response["condor_status_output"] = output.strip()
+    except Exception as e:
+        logging.warning(f"Failed to execute condor_status: {e}")
+        response["status"] = "warning"
+        response["htcondor_connected"] = False
+        response["error"] = str(e)
+
+    return jsonify(response), 200
+
+
 app = Flask(__name__)
 app.add_url_rule("/create", view_func=SubmitHandler, methods=["POST"])
 app.add_url_rule("/delete", view_func=StopHandler, methods=["POST"])
 app.add_url_rule("/status", view_func=StatusHandler, methods=["GET"])
 app.add_url_rule("/getLogs", view_func=LogsHandler, methods=["GET"])
+app.add_url_rule("/system-info", view_func=SystemInfoHandler, methods=["GET"])
 
 if __name__ == "__main__":
     app.run(port=args.port, host="0.0.0.0", debug=True)
