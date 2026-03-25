@@ -513,13 +513,18 @@ class TestRunCtnOutputRedirection:
 class TestRunCtnWithProbes:
     """Probe cleanup traps appear before helpers; probe sub-shells before runCtn."""
 
-    def test_cleanup_before_runctn_helpers(self):
+    def _make_probe_script(self):
+        """Return (probe_script, cleanup_script) for a container with a liveness probe."""
         container = _container(
             "c1",
             "docker://busybox:latest",
             livenessProbe={"httpGet": {"port": 8080}},
         )
         probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
+        return container, probe_script, cleanup_script
+
+    def test_cleanup_before_runctn_helpers(self):
+        container, probe_script, cleanup_script = self._make_probe_script()
         script = _make_script(
             [container],
             [("c1", ["singularity", "exec", "docker://busybox:latest"])],
@@ -531,12 +536,7 @@ class TestRunCtnWithProbes:
         assert cleanup_pos < helpers_pos
 
     def test_probe_subshell_before_runctn_call(self):
-        container = _container(
-            "c1",
-            "docker://busybox:latest",
-            livenessProbe={"httpGet": {"port": 8080}},
-        )
-        probe_script, cleanup_script = prepare_probes(container, _BASE_METADATA)
+        container, probe_script, cleanup_script = self._make_probe_script()
         script = _make_script(
             [container],
             [("c1", ["singularity", "exec", "docker://busybox:latest"])],
@@ -745,55 +745,40 @@ class TestStatusHandlerMultiPod:
 class TestSystemInfoEndpoint:
     """/system-info must return JSON with status and htcondor_connected fields."""
 
-    def test_system_info_returns_200(self, monkeypatch):
+    @staticmethod
+    def _make_condor_popen(output):
+        """Return a fake os.popen that reads the given string."""
+
         def fake_popen(cmd):
             class FakeProc:
                 def read(self):
-                    return "TotalMachines=10\n"
+                    return output
 
                 def close(self):
                     pass
 
             return FakeProc()
 
-        monkeypatch.setattr(os, "popen", fake_popen)
-        client = _flask_test_client()
-        resp = client.get("/system-info")
+        return fake_popen
+
+    def test_system_info_returns_200(self, monkeypatch):
+        monkeypatch.setattr(os, "popen", self._make_condor_popen("TotalMachines=10\n"))
+        resp = _flask_test_client().get("/system-info")
         assert resp.status_code == 200
 
     def test_system_info_returns_json(self, monkeypatch):
-        def fake_popen(cmd):
-            class FakeProc:
-                def read(self):
-                    return "TotalMachines=10\n"
-
-                def close(self):
-                    pass
-
-            return FakeProc()
-
-        monkeypatch.setattr(os, "popen", fake_popen)
-        client = _flask_test_client()
-        resp = client.get("/system-info")
+        monkeypatch.setattr(os, "popen", self._make_condor_popen("TotalMachines=10\n"))
+        resp = _flask_test_client().get("/system-info")
         data = _json.loads(resp.data)
         assert "status" in data
         assert "htcondor_connected" in data
         assert "timestamp" in data
 
     def test_system_info_connected_when_condor_responds(self, monkeypatch):
-        def fake_popen(cmd):
-            class FakeProc:
-                def read(self):
-                    return "TotalMachines=5 TotalCPUs=20\n"
-
-                def close(self):
-                    pass
-
-            return FakeProc()
-
-        monkeypatch.setattr(os, "popen", fake_popen)
-        client = _flask_test_client()
-        resp = client.get("/system-info")
+        monkeypatch.setattr(
+            os, "popen", self._make_condor_popen("TotalMachines=5 TotalCPUs=20\n")
+        )
+        resp = _flask_test_client().get("/system-info")
         data = _json.loads(resp.data)
         assert data["htcondor_connected"] is True
         assert data["status"] == "ok"
@@ -803,8 +788,7 @@ class TestSystemInfoEndpoint:
             raise OSError("condor not found")
 
         monkeypatch.setattr(os, "popen", fake_popen)
-        client = _flask_test_client()
-        resp = client.get("/system-info")
+        resp = _flask_test_client().get("/system-info")
         assert resp.status_code == 200  # endpoint itself always returns 200
         data = _json.loads(resp.data)
         assert data["htcondor_connected"] is False
