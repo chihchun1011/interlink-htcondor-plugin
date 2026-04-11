@@ -1,6 +1,8 @@
 import argparse
+import base64
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -68,6 +70,9 @@ dummy_job = args.dummy_job
 global JID
 JID = []
 
+# Maximum bytes to retrieve per condor_tail call (10 MiB).
+_CONDOR_TAIL_MAX_BYTES = 10 * 1024 * 1024
+
 
 def read_yaml_file(file_path):
     with open(file_path, "r") as file:
@@ -129,28 +134,87 @@ def prepare_envs(container):
         return [""]
 
 
-def prepare_env_file(container, metadata, env_file_name="jlab.env"):
+def _shell_single_quote(val):
+    """Format *val* as a POSIX shell single-quoted string."""
+    return "'" + str(val).replace("'", "'\"'\"'") + "'"
+
+
+def _wrap_command_with_env(command_tokens, env_file_name):
+    """Source the generated env file inside the container, then exec the command."""
+    if not env_file_name:
+        return command_tokens
+    return [
+        "/bin/sh",
+        "-c",
+        f'. ./{env_file_name} && exec "$@"',
+        "sh",
+    ] + command_tokens
+
+
+def prepare_env_file(container, metadata, container_standalone=None):
+    """Write a sourceable env script for the given container and return its path.
+
+    The file contains ``export`` statements and is sourced inside the container
+    command wrapper instead of being passed via ``--env-file``. This avoids
+    Apptainer re-parsing values like backticks or backslash-escaped quotes.
+
+    ``envFrom`` entries (secretRef / configMapRef) are expanded from the
+    ``container_standalone`` data supplied by the interLink sidecar so that all
+    keys from the referenced Secrets / ConfigMaps are also injected.
+    """
     env_file_name = f"{metadata['name']}-{metadata['uid']}_env.env"
-    env_file_path = os.path.join(InterLinkConfigInst["DataRootFolder"], env_file_name)
+    job_dir = os.path.join(
+        os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+        f"{metadata['name']}-{metadata['uid']}",
+    )
+    os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
+    env_file_path = os.path.join(job_dir, env_file_name)
     lines = []
 
     try:
+        # --- individual env vars (already resolved by interLink) -------------
         for env_var in container.get("env", []):
             name = env_var["name"]
             raw_val = env_var.get("value") or ""
-            safe_val = shlex.quote(raw_val)
-            lines.append(f"{name}={safe_val}")
+            lines.append(f"export {name}={_shell_single_quote(raw_val)}")
 
+        # --- envFrom (bulk import from Secret or ConfigMap) ------------------
+        if container_standalone is not None:
+            secrets_list = container_standalone.get("secrets", [])
+            configmaps_list = container_standalone.get("configMaps", [])
+            for env_from in container.get("envFrom", []):
+                if "secretRef" in env_from:
+                    ref_name = env_from["secretRef"].get("name", "")
+                    for secret in secrets_list:
+                        if secret.get("metadata", {}).get("name") == ref_name:
+                            for k, v in secret.get("data", {}).items():
+                                lines.append(
+                                    f"export {k}={_shell_single_quote(v or '')}"
+                                )
+                elif "configMapRef" in env_from:
+                    ref_name = env_from["configMapRef"].get("name", "")
+                    for cm in configmaps_list:
+                        if cm.get("metadata", {}).get("name") == ref_name:
+                            for k, v in cm.get("data", {}).items():
+                                lines.append(
+                                    f"export {k}={_shell_single_quote(v or '')}"
+                                )
+
+        # Env vars may include secret values resolved by the interLink sidecar.
+        # Write them to a sourceable file and transfer it into the execute
+        # sandbox; the generated container wrapper sources it inside the
+        # container before exec'ing the real command.
         with open(env_file_path, "w") as fp:
             fp.write("\n".join(lines) + "\n")
-        os.chmod(env_file_path, 0o777)
+        os.chmod(env_file_path, 0o644)
         logging.info(f"Wrote env file to {env_file_path}")
 
-        return (["--env-file", env_file_name], env_file_path)
+        return (env_file_name, env_file_path)
 
     except Exception as e:
         logging.error(f"Failed to write env file: {e}")
-        return ([], None)
+        return (None, None)
 
 
 def prepare_mounts(pod, container_standalone):
@@ -162,49 +226,61 @@ def prepare_mounts(pod, container_standalone):
         else container_standalone["name"].split("-")
     )
     pod_name_folder = os.path.join(
-        InterLinkConfigInst["DataRootFolder"], "-".join(pod_name[:-1])
+        os.path.realpath(InterLinkConfigInst["DataRootFolder"]), "-".join(pod_name[:-1])
     )
-    for c in pod["spec"]["containers"]:
+    all_containers = list(pod["spec"]["containers"]) + list(
+        pod["spec"].get("initContainers", [])
+    )
+    for c in all_containers:
         if c["name"] == container_standalone["name"]:
             container = c
-    try:
-        os.makedirs(pod_name_folder, exist_ok=True)
-        logging.info(f"Successfully created folder {pod_name_folder}")
-    except Exception as e:
-        logging.error(e)
-    if "volumeMounts" in container.keys():
-        for mount_var in container["volumeMounts"]:
-            path = ""
-            for vol in pod["spec"]["volumes"]:
-                if vol["name"] != mount_var["name"]:
-                    continue
-                if "configMap" in vol.keys():
-                    config_maps_paths = mountConfigMaps(pod, container_standalone)
-                    # print("bind as configmap", mount_var["name"], vol["name"])
-                    for i, path in enumerate(config_maps_paths):
-                        mount_data.append(path)
-                elif "secret" in vol.keys():
-                    secrets_paths = mountSecrets(pod, container_standalone)
-                    # print("bind as secret", mount_var["name"], vol["name"])
-                    for i, path in enumerate(secrets_paths):
-                        mount_data.append(path)
-                elif "emptyDir" in vol.keys():
-                    path = mount_empty_dir(container, pod)
-                    mount_data.append(path)
-                elif "hostPath" in vol.keys():
-                    host_path = vol["hostPath"]["path"]
-                    mount_path = mount_var["mountPath"]
-                    bind_path = f"{host_path}:{mount_path}"
-                    mount_data.append(bind_path)
-                else:
-                    # Implement logic for other volume types if required.
-                    logging.info("\n*********\n*To be implemented*\n********")
-    else:
-        logging.info("Container has no volume mount")
-        return [""]
+            try:
+                os.makedirs(pod_name_folder, exist_ok=True)
+                os.chmod(pod_name_folder, 0o1777)
+                logging.info(f"Successfully created folder {pod_name_folder}")
+            except Exception as e:
+                logging.error(e)
+            if "volumeMounts" in container.keys():
+                for mount_var in container["volumeMounts"]:
+                    path = ""
+                    for vol in pod["spec"]["volumes"]:
+                        if vol["name"] != mount_var["name"]:
+                            continue
+                        if "configMap" in vol.keys():
+                            config_maps_paths = mountConfigMaps(
+                                pod, container_standalone
+                            )
+                            # print("bind as configmap", mount_var["name"], vol["name"])
+                            for i, path in enumerate(config_maps_paths):
+                                mount_data.append(path)
+                        elif "secret" in vol.keys():
+                            secrets_paths = mountSecrets(pod, container_standalone)
+                            # print("bind as secret", mount_var["name"], vol["name"])
+                            for i, path in enumerate(secrets_paths):
+                                mount_data.append(path)
+                        elif "emptyDir" in vol.keys():
+                            path = mount_empty_dir(
+                                container,
+                                pod,
+                                vol["name"],
+                                mount_var["mountPath"],
+                                read_only=mount_var.get("readOnly", False),
+                            )
+                            mount_data.append(path)
+                        elif "hostPath" in vol.keys():
+                            host_path = vol["hostPath"]["path"]
+                            mount_path = mount_var["mountPath"]
+                            bind_path = f"{host_path}:{mount_path}"
+                            mount_data.append(bind_path)
+                        else:
+                            # Implement logic for other volume types if required.
+                            logging.info("\n*********\n*To be implemented*\n********")
+            else:
+                logging.info("Container has no volume mount")
+                return [""]
 
-    path_hardcoded = ""
-    mount_data.append(path_hardcoded)
+            path_hardcoded = ""
+            mount_data.append(path_hardcoded)
     mounts.append(",".join(mount_data))
     print("mounts are", mounts)
     if mounts[1] == "":
@@ -227,9 +303,21 @@ def mountConfigMaps(pod, container_standalone):
     container = extract_container(pod, container_standalone)
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
-        cmd = ["-rf", os.path.join(os.getcwd(), data_root_folder, "configMaps")]
+        # Clean and recreate per-job configMaps folder
+        job_dir = os.path.join(
+            os.getcwd(),
+            data_root_folder,
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
+        pod_configmaps_root = os.path.join(job_dir, "configMaps")
+        cmd = ["-rf", pod_configmaps_root]
         shell = subprocess.Popen(
-            ["rm"] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            [
+                "rm",
+            ]
+            + cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         _, err = shell.communicate()
 
@@ -243,17 +331,14 @@ def mountConfigMaps(pod, container_standalone):
                 if "configMap" in vol.keys():
                     print("container_standalone:", container_standalone)
                     cfgMaps = container_standalone["configMaps"]
-                    namespace = pod["metadata"]["namespace"]
-                    uid = pod["metadata"]["uid"]
                     for cfgMap in cfgMaps:
                         podConfigMapDir = os.path.join(
-                            os.getcwd(),
-                            data_root_folder,
-                            f"{namespace}-{uid}/configMaps/",
+                            job_dir,
+                            "configMaps",
                             vol["name"],
                         )
                         for key in cfgMap["data"].keys():
-                            path = os.path.join(os.getcwd(), podConfigMapDir, key)
+                            path = os.path.join(podConfigMapDir, key)
                             path += f":{mountSpec['mountPath']}/{key}"
                             configMapNamePaths.append(path)
                         cmd = ["-p", podConfigMapDir]
@@ -285,7 +370,13 @@ def mountSecrets(pod, container_standalone):
     container = extract_container(pod, container_standalone)
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
-        cmd = ["-rf", os.path.join(os.getcwd(), data_root_folder, "secrets")]
+        job_dir = os.path.join(
+            os.getcwd(),
+            data_root_folder,
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
+        pod_secrets_root = os.path.join(job_dir, "secrets")
+        cmd = ["-rf", pod_secrets_root]
         subprocess.run(["rm"] + cmd, check=True)
         for mountSpec in container["volumeMounts"]:
             for vol in pod["spec"]["volumes"]:
@@ -296,12 +387,9 @@ def mountSecrets(pod, container_standalone):
                     for secret in secrets:
                         if secret["metadata"]["name"] != vol["secret"]["secretName"]:
                             continue
-                        namespace = pod["metadata"]["namespace"]
-                        uid = pod["metadata"]["uid"]
                         pod_secret_dir = os.path.join(
-                            os.getcwd(),
-                            data_root_folder,
-                            f"{namespace}-{uid}/secrets/",
+                            job_dir,
+                            "secrets",
                             vol["name"],
                         )
                         for key in secret["data"]:
@@ -314,36 +402,51 @@ def mountSecrets(pod, container_standalone):
                         logging.debug("--- Writing Secret files")
                         for k, v in secret["data"].items():
                             full_path = os.path.join(pod_secret_dir, k)
-                            with open(full_path, "w") as f:
-                                f.write(v)
+                            with open(full_path, "wb") as f:
+                                f.write(base64.b64decode(v))
                             os.chmod(full_path, vol["secret"]["defaultMode"])
                             logging.debug(f"--- Written Secret file {full_path}")
     return secret_name_paths
 
 
-def mount_empty_dir(container, pod):
+def mount_empty_dir(container, pod, vol_name, mount_path, read_only=False):
     ed_path = None
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
-        cmd = ["-rf", os.path.join(InterLinkConfigInst["DataRootFolder"], "emptyDirs")]
-        subprocess.run(["rm"] + cmd, check=True)
-        for mount_spec in container["volumeMounts"]:
-            pod_volume_spec = None
-            for vol in pod["spec"]["volumes"]:
-                if vol.name == mount_spec["name"]:
-                    pod_volume_spec = vol["volumeSource"]
-                    break
-            if pod_volume_spec and pod_volume_spec["EmptyDir"]:
-                ed_path = os.path.join(
-                    InterLinkConfigInst["DataRootFolder"],
-                    pod.namespace + "-" + str(pod.uid) + "/emptyDirs/" + vol.name,
-                )
-                cmd = ["-p", ed_path]
-                subprocess.run(["mkdir"] + cmd, check=True)
-                ed_path += (
-                    ":" + mount_spec["mount_path"] + "/" + mount_spec["name"] + ","
-                )
+        job_dir = os.path.join(
+            os.getcwd(),
+            InterLinkConfigInst["DataRootFolder"],
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
+        empty_dirs_root = os.path.join(job_dir, "emptyDirs")
+        os.makedirs(empty_dirs_root, exist_ok=True)
+        os.chmod(empty_dirs_root, 0o1777)
+        ed_path = os.path.join(empty_dirs_root, vol_name)
+        os.makedirs(ed_path, exist_ok=True)
+        os.chmod(ed_path, 0o1777)
+        ed_path += ":" + mount_path
+        if read_only:
+            ed_path += ":ro"
 
     return ed_path
+
+
+def parse_cpu(value_str):
+    """Parse a Kubernetes CPU value and return an integer number of CPUs (>=1).
+
+    Kubernetes CPU can be expressed as:
+      - Plain integer or float: "1", "2", "0.5"
+      - Millicores: "100m", "500m", "1000m"
+
+    HTCondor RequestCpus requires a whole number, so we round up with a
+    minimum of 1.
+    """
+    value_str = str(value_str).strip()
+    if value_str.endswith("m"):
+        millicores = float(value_str[:-1])
+        cpus = millicores / 1000.0
+    else:
+        cpus = float(value_str)
+    return max(1, int(math.ceil(cpus)))
 
 
 def parse_string_with_suffix(value_str):
@@ -444,11 +547,15 @@ def _is_main_command_line(stripped):
 # These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
 # each Singularity container runs in the background and all exit codes are
 # collected before the job terminates.
+# _IL_POD_NAME and _IL_POD_UID are injected into each generated script.
+# Per-container output files are written to the HTCondor execute sandbox as
+# relative paths (e.g. "${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out") and
+# retrieved by LogsHandler via condor_tail (no shared filesystem required).
 _RUN_CTN_HELPERS = r"""
 runCtn() {
   local ctn="$1"
   shift
-  ( "$@" ) > "${workingPath}/run-${ctn}.out" 2>&1 &
+  ( "$@" ) > "${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
   local pid="$!"
   printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
   pidCtns="${pidCtns} ${pid}:${ctn}"
@@ -479,20 +586,51 @@ endScript() {
 """
 
 
+def _extract_sandbox_bind_dirs(all_commands, input_files=None):
+    """Return the set of relative (./...) bind-source dirs referenced in any
+    command token list.  These are emptyDir directories that must be pre-created
+    inside the HTCondor execute sandbox — HTCondor does not transfer empty
+    directories, so without an explicit mkdir they will be absent and the bind
+    mount will silently fail, leaving the container path read-only.
+
+    ConfigMap and Secret sources are FILES that HTCondor transfers via
+    transfer_input_files — they must NOT be pre-created as directories.
+    We exclude any ./name whose basename matches a file in input_files."""
+    transferred_basenames = set()
+    if input_files:
+        for f in input_files:
+            transferred_basenames.add(os.path.basename(f))
+    dirs = set()
+    for _, tokens in all_commands:
+        for i, tok in enumerate(tokens):
+            if tok == "--bind" and i + 1 < len(tokens):
+                for spec in tokens[i + 1].split(","):
+                    if spec and ":" in spec:
+                        src = spec.split(":")[0]
+                        if src.startswith("./"):
+                            basename = src[2:]  # strip "./"
+                            if basename not in transferred_basenames:
+                                dirs.add(src)
+    return sorted(dirs)
+
+
 def _clean_command_tokens(tokens):
     """Join and clean a list of singularity command tokens into a single string.
 
-    Wraps the token that follows a ``-c`` flag in single quotes (so the shell
-    does not re-split it), then strips empty double-quoted tokens and collapses
-    extra whitespace.
+    Wraps the token that follows a ``-c`` flag with ``shlex.quote`` (so the
+    shell does not re-split multi-line scripts, and single-quotes within the
+    script content are safely escaped), then strips only standalone empty tokens.
+
+    Note: we intentionally do NOT collapse multiple spaces here, because the
+    quoted -c argument may contain Python code with meaningful indentation
+    (multiple spaces).  Extra spaces from empty tokens such as pre_exec="" or
+    singularity_options="" are harmless in a bash command line.
     """
-    result = list(tokens)
+    result = [token for token in tokens if token not in ("", '""')]
     for i in range(1, len(result)):
         if result[i - 1] == "-c":
-            result[i] = "'" + result[i] + "'"
+            result[i] = shlex.quote(result[i])
     line = " ".join(result)
-    line = re.sub(r'\s*""\s*', " ", line)
-    line = re.sub(r" {2,}", " ", line)
     return line.strip()
 
 
@@ -503,12 +641,17 @@ def produce_htcondor_singularity_script(
     input_files,
     probe_scripts=None,
     cleanup_scripts=None,
+    init_container_commands=None,
 ):
     """Write the HTCondor job executable and submit description file.
 
     Each container is launched in the background via a ``runCtn()`` bash
     helper, mirroring the SLURM plugin's pattern.  ``waitCtns()`` collects
     all exit codes, and ``endScript()`` exits with the highest one.
+
+    Init containers (``init_container_commands``) are run sequentially and to
+    completion *before* the main containers start, matching Kubernetes
+    semantics.  If any init container exits non-zero the job aborts.
 
     Parameters
     ----------
@@ -529,17 +672,28 @@ def produce_htcondor_singularity_script(
     cleanup_scripts:
         Cleanup trap snippets produced by prepare_probes(), matching
         probe_scripts.  Pass None (default) for no probes.
+    init_container_commands:
+        List of ``(container_name, [cmd_tokens])`` tuples for init containers.
+        These run sequentially before the main containers.  Pass None (default)
+        for no init containers.
     """
     if probe_scripts is None:
         probe_scripts = []
     if cleanup_scripts is None:
         cleanup_scripts = []
+    if init_container_commands is None:
+        init_container_commands = []
 
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
-    executable_path = f"./{datarootfolder}/{name}-{uid}.sh"
-    sub_path = f"./{datarootfolder}/{name}-{uid}.jdl"
+    abs_dataroot = os.path.realpath(datarootfolder)
+    # Create a unique job directory for all files related to this pod/job
+    job_dir = os.path.join(abs_dataroot, f"{name}-{uid}")
+    os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
+    executable_path = os.path.join(job_dir, f"{name}-{uid}.sh")
+    sub_path = os.path.join(job_dir, f"{name}-{uid}.jdl")
 
     requested_cpus = 0
     requested_memory = 0
@@ -547,7 +701,7 @@ def produce_htcondor_singularity_script(
         if "resources" in c.keys():
             if "requests" in c["resources"].keys():
                 if "cpu" in c["resources"]["requests"].keys():
-                    requested_cpus += int(c["resources"]["requests"]["cpu"])
+                    requested_cpus += parse_cpu(c["resources"]["requests"]["cpu"])
                 if "memory" in c["resources"]["requests"].keys():
                     requested_memory += parse_string_with_suffix(
                         c["resources"]["requests"]["memory"]
@@ -581,8 +735,12 @@ def produce_htcondor_singularity_script(
 
     try:
         with open(executable_path, "w") as f:
-            # ---- shebang ------------------------------------------------
+            # ---- shebang + pod-specific variables -----------------------
+            # _IL_POD_NAME / _IL_POD_UID are used by runCtn() to name the
+            # per-container output files in the HTCondor execute sandbox.
             script_body = "#!/bin/bash\n"
+            script_body += f"export _IL_POD_NAME={shlex.quote(name)}\n"
+            script_body += f"export _IL_POD_UID={shlex.quote(uid)}\n"
 
             # ---- probe cleanup traps (must be defined before any trap) --
             for cs in cleanup_scripts:
@@ -599,6 +757,35 @@ def produce_htcondor_singularity_script(
             for ps in probe_scripts:
                 script_body += "\n" + ps + "\n"
 
+            # ---- pre-create emptyDir sandbox dirs (HTCondor skips empty dirs) -
+            all_cmds = list(init_container_commands or []) + list(container_commands)
+            sandbox_dirs = _extract_sandbox_bind_dirs(all_cmds, input_files)
+            if sandbox_dirs:
+                script_body += "\n# Pre-create emptyDir bind-source dirs in sandbox\n"
+                for d in sandbox_dirs:
+                    script_body += (
+                        f"mkdir -p {shlex.quote(d)} && chmod 1777 {shlex.quote(d)}\n"
+                    )
+
+            # ---- init containers: run sequentially to completion ---------
+            if init_container_commands:
+                script_body += (
+                    "\n# Init containers (run sequentially before main containers)\n"
+                )
+                for ctn_name, cmd_tokens in init_container_commands:
+                    cleaned = _clean_command_tokens(cmd_tokens)
+                    out_file = f'"${{_IL_POD_NAME}}-${{_IL_POD_UID}}-{ctn_name}.out"'
+                    script_body += f"{cleaned} > {out_file} 2>&1\n"
+                    fail_msg = f"Init container {ctn_name} failed with exit code"
+                    script_body += (
+                        "_init_rc=$?\n"
+                        'if [ "$_init_rc" -ne 0 ]; then\n'
+                        f'  printf "%s %s\\n" "{fail_msg}" "$_init_rc"\n'
+                        '  exit "$_init_rc"\n'
+                        "fi\n"
+                    )
+                script_body += "\n"
+
             # ---- main: run every container in background ----------------
             script_body += "\nhighestExitCode=0\n"
             script_body += 'pidCtns=""\n'
@@ -612,19 +799,50 @@ def produce_htcondor_singularity_script(
             script_body += "\nwaitCtns\nendScript\n"
 
             f.write(script_body)
+        logging.info("Generated job script for %s-%s at %s", name, uid, executable_path)
+        logging.debug("Job script content:\n%s", script_body)
+
+        # Ensure log/out/err subdirectories exist under the job directory so that
+        # HTCondor can write the job's Log/Output/Error files there.
+        for subdir in ("log", "out", "err"):
+            subdir_path = os.path.join(job_dir, subdir)
+            os.makedirs(subdir_path, exist_ok=True)
+            os.chmod(subdir_path, 0o1777)
+
+        transfer_input_line = (
+            f"transfer_input_files = {','.join(input_files)}" if input_files else ""
+        )
+
+        # Build the list of per-container output files HTCondor should transfer back
+        # from the execute sandbox to the job directory on the submit node.
+        all_ctn_names = [ctn for ctn, _ in (init_container_commands or [])] + [
+            ctn for ctn, _ in container_commands
+        ]
+        transfer_output_files = ",".join(
+            f"{name}-{uid}-{ctn}.out" for ctn in all_ctn_names
+        )
+        transfer_output_line = (
+            f"transfer_output_files = {transfer_output_files}"
+            if transfer_output_files
+            else 'transfer_output_files = ""'
+        )
 
         job = f"""
 Executable = {executable_path}
+InitialDir = {job_dir}
 
 Log        = log/mm_mul.$(Cluster).$(Process).log
 Output     = out/mm_mul.out.$(Cluster).$(Process)
 Error      = err/mm_mul.err.$(Cluster).$(Process)
 
-transfer_input_files = {",".join(input_files)}
+{transfer_input_line}
+{transfer_output_line}
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
 
+# Retry if the job is held due to the permission error (Code 12, Subcode 13)
+periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
 when_to_transfer_output = ON_EXIT_OR_EVICT
 +MaxWallTimeMins = 60
 
@@ -650,16 +868,20 @@ def produce_htcondor_host_script(container, metadata):
     sub_path = f"{datarootfolder}{name}-{uid}.jdl"
     try:
         with open(executable_path, "w") as f:
-            batch_macros = f"""#!{container['command'][-1]}
-""" + "\n".join(
-                container["args"][-1].split("; ")
-            )
+            shebang_line = f"#!{container['command'][-1]}\n"
+            script_body = "\n".join(container["args"][-1].split("; "))
+            batch_macros = shebang_line + script_body
 
             f.write(batch_macros)
 
-        requested_cpu = container["resources"]["requests"]["cpu"]
+        requested_cpu = parse_cpu(container["resources"]["requests"]["cpu"])
         # requested_memory = int(container['resources']['requests']['memory'])/1e6
         requested_memory = container["resources"]["requests"]["memory"]
+        abs_dataroot = os.path.realpath(datarootfolder)
+        for subdir in ("log", "out", "err"):
+            subdir_path = os.path.join(abs_dataroot, subdir)
+            os.makedirs(subdir_path, exist_ok=True)
+            os.chmod(subdir_path, 0o1777)
         job = f"""
 Executable = {executable_path}
 
@@ -671,6 +893,8 @@ should_transfer_files = YES
 RequestCpus = {requested_cpu}
 RequestMemory = {requested_memory}
 
+# Retry if the job is held due to the permission error (Code 12, Subcode 13)
+periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
 when_to_transfer_output = ON_EXIT_OR_EVICT
 +MaxWallTimeMins = 60
 
@@ -689,33 +913,102 @@ Queue 1
 
 def htcondor_batch_submit(job):
     logging.info("Submitting HTCondor job")
+
+    # Resolve to an absolute path so the argument can never be confused with
+    # a flag (e.g. a pod whose name begins with '-'), and validate that the
+    # file stays inside the configured DataRootFolder.
+    data_root = os.path.realpath(InterLinkConfigInst["DataRootFolder"])
+    job_real = os.path.realpath(job)
+    if not (job_real == data_root or job_real.startswith(data_root + os.sep)):
+        raise ValueError(f"Submit file path escapes data root: {job!r}")
+
     collector = args.collector_host
     schedd = args.schedd_host
-    process = os.popen(f"condor_submit -pool {collector} -remote {schedd} {job} -spool")
-    preprocessed = process.read()
-    process.close()
-    jid = preprocessed.split(" ")[-1].split(".")[0]
+    if collector and schedd:
+        # Remote submission: forward the job to a specific pool and schedd.
+        cmd = [
+            "condor_submit",
+            "-pool",
+            collector,
+            "-remote",
+            schedd,
+            job_real,
+            "-spool",
+        ]
+    else:
+        # Local submission: use the schedd discovered from the local HTCondor pool.
+        cmd = ["condor_submit", job_real]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"condor_submit failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+
+    preprocessed = result.stdout
+    # Expected output: "1 job(s) submitted to cluster 12345."
+    parts = preprocessed.strip().split(" ")
+    if not parts:
+        raise RuntimeError(f"Unexpected condor_submit output: {preprocessed!r}")
+    jid = parts[-1].split(".")[0].strip()
+    if not jid.isdigit():
+        raise RuntimeError(
+            f"Could not parse cluster ID from condor_submit output: {preprocessed!r}"
+        )
 
     return jid
 
 
 def delete_pod(pod):
-
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = pod["metadata"]["name"]
     uid = pod["metadata"]["uid"]
 
     logging.info(f"Deleting pod {pod['metadata']['name']}")
-    with open(f"{datarootfolder}{name}-{uid}.jid") as f:
+    job_dir = os.path.join(os.path.realpath(datarootfolder), f"{name}-{uid}")
+    jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
+    with open(jid_path) as f:
         data = f.read()
     jid = int(data.strip())
     process = os.popen(f"condor_rm {jid}")
     preprocessed = process.read()
     process.close()
-    os.remove(f"{datarootfolder}{name}-{uid}.jid")
-    os.remove(f"{datarootfolder}{name}-{uid}.sh")
-    os.remove(f"{datarootfolder}{name}-{uid}.jdl")
-    os.remove(f"{datarootfolder}{name}-{uid}_env.env")
+
+    # Remove job directory contents
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.jid"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.sh"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.jdl"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}_env.env"))
+    except FileNotFoundError:
+        pass
+
+    # Clean up per-container log files transferred back by HTCondor inside job dir.
+    try:
+        with os.scandir(job_dir) as it:
+            for entry in it:
+                if entry.name.startswith(f"{name}-{uid}-") and entry.name.endswith(
+                    ".out"
+                ):
+                    os.remove(entry.path)
+    except OSError as e:
+        logging.warning(f"Could not clean up log files for {name}-{uid}: {e}")
+
+    # Optionally remove the job directory if empty
+    try:
+        os.rmdir(job_dir)
+    except OSError:
+        # Directory not empty or other error — leave it in place
+        pass
 
     return preprocessed
 
@@ -725,16 +1018,14 @@ def handle_jid(jid, pod):
     name = pod["metadata"]["name"]
     uid = pod["metadata"]["uid"]
 
-    with open(
-        f"{datarootfolder}{name}-{uid}.jid",
-        "w",
-    ) as f:
+    job_dir = os.path.join(os.path.realpath(datarootfolder), f"{name}-{uid}")
+    os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
+    jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
+    with open(jid_path, "w") as f:
         f.write(str(jid))
     JID.append({"JID": jid, "pod": pod})
-    logging.info(
-        f"Job {jid} submitted successfully",
-        f"{datarootfolder}{name}-{uid}.jid",
-    )
+    logging.info(f"Job {jid} submitted successfully: {jid_path}")
 
 
 def SubmitHandler():
@@ -777,6 +1068,7 @@ def SubmitHandler():
     # print("Requested pod metadata name is: ", pod["metadata"]["name"])
     metadata = pod.get("metadata", {})
     containers = pod.get("spec", {}).get("containers", [])
+    init_containers = pod.get("spec", {}).get("initContainers", [])
 
     # NORMAL CASE
     if "host" not in containers[0]["image"]:
@@ -785,19 +1077,125 @@ def SubmitHandler():
         # container_commands collects (name, [tokens]) tuples for every container,
         # mirroring the SLURM plugin's runCtn pattern.
         container_commands = []
+        init_container_commands = []
         # all_input_files is accumulated across all containers (deduped via seen set)
         all_input_files = []
         seen_input_files = set()
+
+        # ---- init containers (run before main containers) -------------------
+        for container in init_containers:
+            logging.info(f"Building init-container command for {container['name']}")
+            commstr1 = ["singularity", "exec"]
+            image = ""
+            mounts = [""]
+            container_standalone = None
+            singularity_options = metadata.get("annotations", {}).get(
+                "slurm-job.vk.io/singularity-options", ""
+            )
+            pre_exec = metadata.get("annotations", {}).get(
+                "slurm-job.vk.io/pre-exec", ""
+            )
+            if containers_standalone is not None:
+                for c in containers_standalone:
+                    if c["name"] == container["name"]:
+                        container_standalone = c
+                        mounts = prepare_mounts(pod, container_standalone)
+                        break
+            env_file_name, env_path = prepare_env_file(
+                container, metadata, container_standalone
+            )
+            env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
+            if container["image"].startswith("/cvmfs") or container["image"].startswith(
+                "docker://"
+            ):
+                image = container["image"]
+            else:
+                image = "docker://" + container["image"]
+            for mount in mounts[-1].split(","):
+                if "/cvmfs" not in mount:
+                    mount_src = mount.split(":")[0]
+                    if mount_src and mount_src not in seen_input_files:
+                        all_input_files.append(mount_src)
+                        seen_input_files.add(mount_src)
+            if env_path and env_path not in seen_input_files:
+                all_input_files.append(env_path)
+                seen_input_files.add(env_path)
+            local_mounts = ["--bind", ""]
+            for mount in (mounts[-1].split(","))[:-1]:
+                if not mount or ":" not in mount:
+                    continue
+                parts = mount.split(":")
+                if "/cvmfs" not in mount:
+                    prefix_ = "./"
+                else:
+                    prefix_ = "/"
+                local_src = prefix_ + parts[0].split("/")[-1]
+                local_dst = parts[1]
+                mount_opts = parts[2] if len(parts) > 2 else None
+                if mount_opts:
+                    local_mounts[1] += f"{local_src}:{local_dst}:{mount_opts},"
+                else:
+                    local_mounts[1] += f"{local_src}:{local_dst},"
+            if local_mounts[-1] == "":
+                local_mounts = [""]
+            if "command" in container and "args" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"] + container["args"], env_file_name
+                )
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + local_mounts
+                    + [image]
+                    + container_entrypoint
+                )
+            elif "command" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"], env_file_name
+                )
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + local_mounts
+                    + [image]
+                    + container_entrypoint
+                )
+            elif "args" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["args"], env_file_name
+                )
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + local_mounts
+                    + [image]
+                    + container_entrypoint
+                )
+            else:
+                # No command and no args: use singularity run to invoke the
+                # image's default ENTRYPOINT/CMD.  singularity exec without an
+                # explicit command is not valid and would fail immediately.
+                singularity_command = (
+                    [pre_exec]
+                    + ["singularity", "run"]
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
+                )
+            init_container_commands.append((container["name"], singularity_command))
 
         for container in containers:
             logging.info(
                 f"Beginning script generation for container {container['name']}"
             )
             commstr1 = ["singularity", "exec"]
-            # envs = prepare_envs(container)
-            env_flags, env_path = prepare_env_file(container, metadata)
             image = ""
             mounts = [""]
+            container_standalone = None
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
@@ -813,8 +1211,12 @@ def SubmitHandler():
                     if c["name"] == container["name"]:
                         container_standalone = c
                         mounts = prepare_mounts(pod, container_standalone)
-            else:
-                mounts = [""]
+                        break
+            # envs = prepare_envs(container)
+            env_file_name, env_path = prepare_env_file(
+                container, metadata, container_standalone
+            )
+            env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
             # if container["image"].startswith("/") or ".io" in container["image"]:
             # if container["image"].startswith("/") or "://" in container["image"]:
             #    image_uri = metadata.get("Annotations", {}).get(
@@ -841,22 +1243,25 @@ def SubmitHandler():
                     if mount_src and mount_src not in seen_input_files:
                         all_input_files.append(mount_src)
                         seen_input_files.add(mount_src)
-                if env_path and env_path not in seen_input_files:
-                    all_input_files.append(env_path)
-                    seen_input_files.add(env_path)
+            if env_path and env_path not in seen_input_files:
+                all_input_files.append(env_path)
+                seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
+                if not mount or ":" not in mount:
+                    continue
+                parts = mount.split(":")
                 if "/cvmfs" not in mount:
                     prefix_ = "./"
                 else:
                     prefix_ = "/"
-                local_mounts[1] += (
-                    prefix_
-                    + (mount.split(":")[0]).split("/")[-1]
-                    + ":"
-                    + mount.split(":")[1]
-                    + ","
-                )
+                local_src = prefix_ + parts[0].split("/")[-1]
+                local_dst = parts[1]
+                mount_opts = parts[2] if len(parts) > 2 else None
+                if mount_opts:
+                    local_mounts[1] += f"{local_src}:{local_dst}:{mount_opts},"
+                else:
+                    local_mounts[1] += f"{local_src}:{local_dst},"
             if local_mounts[-1] == "":
                 local_mounts = [""]
 
@@ -865,39 +1270,52 @@ def SubmitHandler():
             cleanup_scripts.append(cleanup_script)
 
             if "command" in container.keys() and "args" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"] + container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
-                    + container["args"]
+                    + container_entrypoint
                 )
             elif "command" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
+                    + container_entrypoint
                 )
             elif "args" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
+                    + local_mounts
+                    + [image]
+                    + container_entrypoint
+                )
+            else:
+                # No command and no args: use singularity run to invoke the
+                # image's default ENTRYPOINT/CMD.  singularity exec without an
+                # explicit command is not valid and would fail immediately.
+                singularity_command = (
+                    [pre_exec]
+                    + ["singularity", "run"]
+                    + [singularity_options]
                     + env_flags
                     + local_mounts
                     + [image]
-                    + container["args"]
-                )
-            else:
-                singularity_command = (
-                    [pre_exec] + commstr1 + env_flags + local_mounts + [image]
                 )
             # Collect as (name, tokens) for runCtn pattern
             container_commands.append((container["name"], singularity_command))
@@ -909,6 +1327,7 @@ def SubmitHandler():
             all_input_files,
             probe_scripts=probe_scripts,
             cleanup_scripts=cleanup_scripts,
+            init_container_commands=init_container_commands,
         )
 
     else:
@@ -922,13 +1341,13 @@ def SubmitHandler():
         logging.info(f"Job submitted with cluster id: {out_jid}")
         handle_jid(out_jid, pod)
 
-        # Verify job submission was successful
-        jid_file = (
-            InterLinkConfigInst["DataRootFolder"]
-            + pod["metadata"]["name"]
-            + "-"
-            + pod["metadata"]["uid"]
-            + ".jid"
+        # Verify job submission: the JID file must live in the per-job directory
+        job_dir = os.path.join(
+            os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
+        jid_file = os.path.join(
+            job_dir, f"{pod['metadata']['name']}-{pod['metadata']['uid']}.jid"
         )
         if not os.path.exists(jid_file):
             raise Exception("JID file was not created")
@@ -965,16 +1384,15 @@ def StopHandler():
     try:
         return_message = delete_pod(req)
         logging.info(f"Pod deletion result: {return_message}")
-        # Check if deletion was successful
-        if "All" in return_message or "removed" in return_message.lower():
-            resp = {
-                "message": "Pod successfully deleted",
-                "podUID": req.get("metadata", {}).get("uid", ""),
-                "podName": req.get("metadata", {}).get("name", ""),
-            }
-            return success_response(resp, 200)
-        else:
-            return error_response("Failed to delete pod from HTCondor", 500)
+        # condor_rm returns "All jobs removed" on success, or a message like
+        # "There are no jobs in the queue" / "Couldn't find/remove all jobs"
+        # when the job already finished.  Both outcomes mean the job is gone.
+        resp = {
+            "message": "Pod successfully deleted",
+            "podUID": req.get("metadata", {}).get("uid", ""),
+            "podName": req.get("metadata", {}).get("name", ""),
+        }
+        return success_response(resp, 200)
     except FileNotFoundError as e:
         logging.error(f"Pod files not found during deletion: {e}")
         return error_response("Pod not found or already deleted", 404)
@@ -992,14 +1410,15 @@ def StatusHandler():
         # Handle ping requests (empty array)
         if isinstance(req_list, list) and len(req_list) == 0:
             logging.info("Received ping request")
-            if args.proxy and os.path.isfile(args.proxy):
-                return success_response(
-                    {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
-                )
-            else:
+            # If no proxy path is configured (local/mini HTCondor), skip the
+            # check entirely.  If a path is configured, verify the file exists.
+            if args.proxy and not os.path.isfile(args.proxy):
                 return error_response(
                     "HTCondor sidecar not ready - proxy file not available", 503
                 )
+            return success_response(
+                {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
+            )
         # Validate request format
         if not isinstance(req_list, list):
             return error_response("Status request must be an array", 400)
@@ -1022,12 +1441,12 @@ def StatusHandler():
     resp = []
     for req in req_list:
         try:
-            jid_file = (
-                InterLinkConfigInst["DataRootFolder"]
-                + req["metadata"]["name"]
-                + "-"
-                + req["metadata"]["uid"]
-                + ".jid"
+            job_dir = os.path.join(
+                os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+                f"{req['metadata']['name']}-{req['metadata']['uid']}",
+            )
+            jid_file = os.path.join(
+                job_dir, f"{req['metadata']['name']}-{req['metadata']['uid']}.jid"
             )
             with open(jid_file, "r") as f:
                 jid_job = f.read().strip()
@@ -1146,17 +1565,149 @@ def StatusHandler():
 
 def LogsHandler():
     logging.info("HTCondor Sidecar: received GetLogs call")
-    request_data_string = request.data.decode("utf-8")
-    # print(request_data_string)
-    req = json.loads(request_data_string)
-    if req is None or not isinstance(req, dict):
-        # print("Invalid logs request body is: ", req)
-        logging.error("Invalid request data")
-        return "Invalid request data for getting logs", 400
+    try:
+        request_data_string = request.data.decode("utf-8")
+        req = json.loads(request_data_string)
+        if req is None or not isinstance(req, dict):
+            logging.error("Invalid request data")
+            return "Invalid request data for getting logs", 400
 
-    resp = "NOT IMPLEMENTED"
+        pod_name = req.get("PodName", "")
+        pod_uid = req.get("PodUID", "")
+        container_name = req.get("ContainerName", "")
 
-    return json.dumps(resp), 200
+        job_dir = os.path.join(
+            os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+            f"{pod_name}-{pod_uid}",
+        )
+
+        if not pod_name or not pod_uid or not container_name:
+            logging.warning("GetLogs: missing PodName/PodUID/ContainerName in request")
+            return "", 200
+
+        datarootfolder = InterLinkConfigInst["DataRootFolder"]
+        dataroot_real = os.path.realpath(datarootfolder)
+
+        # Sanitize each name component.  os.path.basename strips embedded path
+        # separators; the regex further limits characters to those allowed in
+        # Kubernetes names (alphanumeric, hyphens, dots) plus UUID hyphens,
+        # preventing null bytes and other unexpected characters.
+        _safe = re.compile(r"^[a-zA-Z0-9._-]+$")
+        parts = {
+            "PodName": os.path.basename(pod_name),
+            "PodUID": os.path.basename(pod_uid),
+            "ContainerName": os.path.basename(container_name),
+        }
+        for field, value in parts.items():
+            if not value or not _safe.match(value):
+                logging.error(f"GetLogs: invalid {field} value: {value!r}")
+                return "", 400
+
+        # The per-container output file is written to the HTCondor execute sandbox
+        # as a relative path by runCtn().  condor_tail must therefore use the
+        # sandbox filename, while the post-transfer fallback reads the copy under
+        # the per-job directory in the data root.
+        sandbox_log_filename = (
+            f"{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
+        )
+        transferred_log_path = os.path.join(job_dir, sandbox_log_filename)
+
+        opts = req.get("Opts", {})
+        raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
+        tail = raw_tail if isinstance(raw_tail, int) and raw_tail > 0 else 0
+
+        content = None
+
+        # --- Try condor_tail first (no shared filesystem required) ---
+        job_dir = os.path.join(
+            os.path.realpath(datarootfolder), f"{parts['PodName']}-{parts['PodUID']}"
+        )
+        jid_file = os.path.join(job_dir, f"{parts['PodName']}-{parts['PodUID']}.jid")
+        # Validate the jid_file path stays within the data root before opening.
+        jid_file_real = os.path.realpath(jid_file)
+        if os.path.exists(jid_file_real) and jid_file_real.startswith(
+            dataroot_real + os.sep
+        ):
+            try:
+                with open(jid_file_real, "r") as fh:
+                    cluster_id = fh.read().strip()
+                if cluster_id.isdigit():
+                    proc_id = f"{cluster_id}.0"
+                    # condor_tail retrieves the file from the execute sandbox via
+                    # the HTCondor networking protocol; works for running jobs and
+                    # recently-completed jobs whose sandbox has not yet been cleaned.
+                    # proc_id is digits + ".0"; log_filename is validated by _safe.
+                    collector = args.collector_host
+                    schedd = args.schedd_host
+                    if collector and schedd:
+                        cmd = [
+                            "condor_tail",
+                            "-pool",
+                            collector,
+                            "-name",
+                            schedd,
+                            "-maxbytes",
+                            str(_CONDOR_TAIL_MAX_BYTES),
+                            proc_id,
+                            sandbox_log_filename,
+                        ]
+                    else:
+                        cmd = [
+                            "condor_tail",
+                            "-maxbytes",
+                            str(_CONDOR_TAIL_MAX_BYTES),
+                            proc_id,
+                            sandbox_log_filename,
+                        ]
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=60
+                    )
+                    if result.stdout:
+                        content = result.stdout
+                        logging.info(
+                            "GetLogs: retrieved via condor_tail for"
+                            f" {proc_id} {sandbox_log_filename}"
+                        )
+                    else:
+                        logging.info(
+                            f"GetLogs: condor_tail rc={result.returncode}"
+                            f" ({result.stderr.strip()!r}), falling back to file"
+                        )
+                else:
+                    logging.warning(
+                        f"GetLogs: invalid cluster_id in {jid_file}: {cluster_id!r}"
+                    )
+            except Exception as e:
+                logging.info(f"GetLogs: condor_tail failed ({e}), falling back to file")
+
+        # --- Fall back to the HTCondor-transferred copy in the data root ---
+        # After the job completes, HTCondor transfers the sandbox file back to
+        # InitialDir (abs_dataroot) via the standard file-transfer mechanism.
+        if content is None:
+            log_file_real = os.path.realpath(transferred_log_path)
+            # After resolving symlinks, the file must live *inside* the data root
+            # (not equal to it and not outside it).
+            if not log_file_real.startswith(dataroot_real + os.sep):
+                logging.error(
+                    f"GetLogs: path traversal attempt blocked: {transferred_log_path!r}"
+                )
+                return "", 400
+            logging.info(f"GetLogs: reading transferred file {log_file_real}")
+            try:
+                with open(log_file_real, "r", errors="replace") as fh:
+                    content = fh.read()
+            except FileNotFoundError:
+                logging.info(f"GetLogs: log file not found yet: {log_file_real}")
+                return "", 200
+
+        if tail > 0 and content:
+            lines = content.splitlines(keepends=True)
+            content = "".join(lines[-tail:])
+        return content or "", 200, {"Content-Type": "text/plain"}
+
+    except Exception as e:
+        logging.error(f"Error in LogsHandler: {e}")
+        return "", 200
 
 
 def SystemInfoHandler():

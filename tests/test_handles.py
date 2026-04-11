@@ -192,9 +192,8 @@ class TestPrepareProbesAnnotations:
 
     def test_custom_singularity_path_from_config(self):
         orig = handles.InterLinkConfigInst.get("SingularityPath")
-        handles.InterLinkConfigInst[
-            "SingularityPath"
-        ] = "/opt/singularity/bin/singularity"
+        singularity_path = "/opt/singularity/bin/singularity"
+        handles.InterLinkConfigInst["SingularityPath"] = singularity_path
         try:
             container = _container(livenessProbe={"exec": {"command": ["true"]}})
             probe_script, _ = prepare_probes(container, _BASE_METADATA)
@@ -302,8 +301,10 @@ def _make_script(
                 handles.InterLinkConfigInst["DataRootFolder"] = orig_dr
             os.chdir(orig_dir)
 
-        # Read the generated .sh file
-        sh_path = os.path.join(tmpdir, f"{metadata['name']}-{metadata['uid']}.sh")
+        # Read the generated .sh file — produce_htcondor_singularity_script
+        # places it in a per-pod subdirectory: {name}-{uid}/{name}-{uid}.sh
+        job_dir = os.path.join(tmpdir, f"{metadata['name']}-{metadata['uid']}")
+        sh_path = os.path.join(job_dir, f"{metadata['name']}-{metadata['uid']}.sh")
         with open(sh_path) as fh:
             return fh.read()
 
@@ -482,14 +483,15 @@ class TestRunCtnMultiContainer:
 
 
 class TestRunCtnOutputRedirection:
-    """runCtn redirects output to workingPath/run-<name>.out."""
+    """runCtn redirects output to a per-container .out file."""
 
     def test_runctn_body_redirects_to_workingpath(self):
         script = _make_script(
             _ONE_CONTAINER,
             [("c1", ["singularity", "exec", "docker://busybox:latest"])],
         )
-        assert '"${workingPath}/run-${ctn}.out"' in script
+        # Output is written to {podname}-{poduid}-{ctn}.out in the sandbox
+        assert '"${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out"' in script
 
     def test_background_ampersand_in_runctn(self):
         script = _make_script(
@@ -567,6 +569,41 @@ class TestCleanCommandTokens:
         result = handles._clean_command_tokens(["a", "", "b"])
         assert "  " not in result
 
+    def test_literal_empty_string_inside_c_script_is_preserved(self):
+        script = "python - <<'EOF'\nprint((\"\", 8080))\nEOF"
+        result = handles._clean_command_tokens(["sh", "-c", script])
+        assert '("", 8080)' in result
+
+
+class TestPrepareEnvFile:
+    def test_prepare_env_file_writes_export_lines(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "env": [
+                    {"name": "BACKTICKS", "value": "Run `command` here"},
+                    {"name": "SINGLE_QUOTES", "value": "It's working"},
+                ],
+            },
+            {"name": "pod-a", "uid": "uid-a"},
+        )
+        assert env_file_name == "pod-a-uid-a_env.env"
+        content = open(env_path).read()
+        assert "export BACKTICKS='Run `command` here'" in content
+        assert "export SINGLE_QUOTES='It'\"'\"'s working'" in content
+
+    def test_wrap_command_with_env_injects_shell_wrapper(self):
+        wrapped = handles._wrap_command_with_env(
+            ["python", "-c", "print('ok')"], "env.env"
+        )
+        assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
+        assert wrapped[4:] == ["python", "-c", "print('ok')"]
+
 
 # ---------------------------------------------------------------------------
 # API compatibility tests — interlink 0.6.1
@@ -601,7 +638,9 @@ class TestCreateResponseFormat:
         )
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
-        (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
+        job_dir = tmp_path / "test-pod-uid-123"
+        job_dir.mkdir()
+        (job_dir / "test-pod-uid-123.jid").write_text("123.0")
         monkeypatch.setattr(
             handles,
             "produce_htcondor_singularity_script",
@@ -635,7 +674,9 @@ class TestStatusHandlerMultiPod:
     """/status must return statuses for ALL pods in the request array."""
 
     def _make_jid_file(self, tmp_path, pod_name, pod_uid, jid):
-        (tmp_path / f"{pod_name}-{pod_uid}.jid").write_text(jid)
+        job_dir = tmp_path / f"{pod_name}-{pod_uid}"
+        job_dir.mkdir()
+        (job_dir / f"{pod_name}-{pod_uid}.jid").write_text(jid)
 
     def _setup_config(self, tmp_path, monkeypatch):
         """Patch InterLinkConfigInst to use tmp_path as data root."""
@@ -740,6 +781,49 @@ class TestStatusHandlerMultiPod:
         # Only pod-a should be in the response
         assert len(statuses) == 1
         assert statuses[0]["name"] == "pod-a"
+
+
+class TestLogsHandler:
+    def test_getlogs_uses_sandbox_filename_for_condor_tail(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+
+        job_dir = tmp_path / "pod-a-uid-a"
+        job_dir.mkdir()
+        (job_dir / "pod-a-uid-a.jid").write_text("100")
+
+        seen = {}
+
+        def fake_run(cmd, capture_output, text, timeout):
+            seen["cmd"] = cmd
+
+            class Result:
+                returncode = 1
+                stdout = "probe log line\n"
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr(handles.subprocess, "run", fake_run)
+
+        resp = _flask_test_client().get(
+            "/getLogs",
+            data=_json.dumps(
+                {
+                    "PodName": "pod-a",
+                    "PodUID": "uid-a",
+                    "ContainerName": "main",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 200
+        assert resp.data.decode() == "probe log line\n"
+        assert seen["cmd"][-1] == "pod-a-uid-a-main.out"
 
 
 class TestSystemInfoEndpoint:
