@@ -271,6 +271,8 @@ def _make_script(
     probe_scripts=None,
     cleanup_scripts=None,
     data_root=None,
+    prestop_trap=None,
+    poststart_hooks=None,
 ):
     """Call produce_htcondor_singularity_script in a temp dir and return the
     generated bash script content."""
@@ -293,6 +295,8 @@ def _make_script(
                 input_files,
                 probe_scripts=probe_scripts,
                 cleanup_scripts=cleanup_scripts,
+                prestop_trap=prestop_trap,
+                poststart_hooks=poststart_hooks,
             )
         finally:
             if orig_dr is None:
@@ -603,6 +607,541 @@ class TestPrepareEnvFile:
         )
         assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
         assert wrapped[4:] == ["python", "-c", "print('ok')"]
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hook tests — _translate_lifecycle_hook, generate_prestop_trap,
+# prepare_lifecycle_hooks, and script injection via produce_htcondor_singularity_script
+# ---------------------------------------------------------------------------
+
+
+class TestTranslateLifecycleHook:
+    """Unit tests for _translate_lifecycle_hook."""
+
+    def test_none_returns_none(self):
+        assert handles._translate_lifecycle_hook(None) is None
+
+    def test_empty_dict_returns_none(self):
+        assert handles._translate_lifecycle_hook({}) is None
+
+    def test_exec_hook_basic(self):
+        handler = {"exec": {"command": ["/bin/sh", "-c", "echo done"]}}
+        result = handles._translate_lifecycle_hook(handler)
+        assert result is not None
+        assert result["type"] == "exec"
+        assert result["command"] == ["/bin/sh", "-c", "echo done"]
+
+    def test_exec_hook_empty_command_returns_none(self):
+        handler = {"exec": {"command": []}}
+        result = handles._translate_lifecycle_hook(handler)
+        assert result is None
+
+    def test_httpget_hook_basic(self):
+        handler = {"httpGet": {"path": "/stop", "port": 8080, "scheme": "HTTP"}}
+        result = handles._translate_lifecycle_hook(handler)
+        assert result is not None
+        assert result["type"] == "httpget"
+        assert result["path"] == "/stop"
+        assert result["port"] == 8080
+        assert result["scheme"] == "http"
+        assert result["host"] == "localhost"
+
+    def test_httpget_hook_defaults(self):
+        handler = {"httpGet": {"port": 9090}}
+        result = handles._translate_lifecycle_hook(handler)
+        assert result is not None
+        assert result["path"] == "/"
+        assert result["scheme"] == "http"
+        assert result["host"] == "localhost"
+
+    def test_httpget_named_port_returns_none(self, caplog):
+        import logging
+
+        handler = {"httpGet": {"port": "http", "path": "/stop"}}
+        with caplog.at_level(logging.WARNING):
+            result = handles._translate_lifecycle_hook(handler)
+        assert result is None
+        assert "named port" in caplog.text
+
+    def test_unsupported_type_returns_none(self, caplog):
+        import logging
+
+        handler = {"tcpSocket": {"port": 8080}}
+        with caplog.at_level(logging.WARNING):
+            result = handles._translate_lifecycle_hook(handler)
+        assert result is None
+
+
+class TestGeneratePreStopTrap:
+    """Unit tests for generate_prestop_trap."""
+
+    def _base_metadata(self, annotations=None):
+        return {
+            "name": "test-pod",
+            "uid": "abc-123",
+            "annotations": annotations or {},
+        }
+
+    def test_no_lifecycle_returns_empty(self):
+        containers = [{"name": "c1", "image": "busybox:latest"}]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert result == ""
+
+    def test_null_lifecycle_returns_empty(self):
+        containers = [{"name": "c1", "image": "busybox:latest", "lifecycle": None}]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert result == ""
+
+    def test_empty_lifecycle_returns_empty(self):
+        containers = [{"name": "c1", "image": "busybox:latest", "lifecycle": {}}]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert result == ""
+
+    def test_exec_prestop_hook_defines_function(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "nginx -s quit"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "preStopTrap()" in result
+
+    def test_exec_prestop_registers_sigterm_trap(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "nginx -s quit"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "trap preStopTrap SIGTERM" in result
+
+    def test_exec_prestop_runs_command_in_singularity(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "docker://nginx:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "nginx -s quit"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "singularity" in result
+        assert "docker://nginx:latest" in result
+        assert "timeout" in result
+
+    def test_exec_prestop_plain_image_gets_docker_prefix(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "nginx:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/usr/sbin/nginx", "-s", "quit"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "docker://nginx:latest" in result
+
+    def test_httpget_prestop_uses_curl(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"httpGet": {"path": "/shutdown", "port": 8080}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "curl" in result
+        assert "http://localhost:8080/shutdown" in result
+
+    def test_prestop_terminates_pidctns(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "cleanup"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        # Must iterate over pidCtns and kill each container
+        assert "pidCtns" in result
+        assert 'kill "${pid}"' in result
+
+    def test_prestop_waits_after_termination(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["true"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "wait" in result
+
+    def test_multiple_containers_all_hooks_present(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {"preStop": {"exec": {"command": ["stop-c1"]}}},
+            },
+            {
+                "name": "c2",
+                "image": "alpine:latest",
+                "lifecycle": {"preStop": {"exec": {"command": ["stop-c2"]}}},
+            },
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "c1" in result
+        assert "c2" in result
+        # Only one SIGTERM trap should be registered
+        assert result.count("trap preStopTrap SIGTERM") == 1
+
+    def test_singularity_options_from_annotation(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "cleanup"]}}
+                },
+            }
+        ]
+        metadata = self._base_metadata(
+            annotations={"slurm-job.vk.io/singularity-options": "--nv"}
+        )
+        result = handles.generate_prestop_trap(containers, metadata)
+        assert "--nv" in result
+
+    def test_output_file_uses_workingpath(self):
+        containers = [
+            {
+                "name": "my-app",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "quit"]}}
+                },
+            }
+        ]
+        result = handles.generate_prestop_trap(containers, self._base_metadata())
+        assert "prestop-my-app.out" in result
+        assert "${workingPath}" in result
+
+
+class TestPreStopTrapInScript:
+    """Integration tests: preStop trap is injected into the generated script."""
+
+    def _container_with_prestop(self, name="c1", image="docker://busybox:latest", cmd=None):
+        if cmd is None:
+            cmd = ["/bin/sh", "-c", "cleanup"]
+        return {
+            "name": name,
+            "image": image,
+            "lifecycle": {"preStop": {"exec": {"command": cmd}}},
+        }
+
+    def test_trap_in_script_when_prestop_defined(self):
+        container = self._container_with_prestop()
+        prestop_trap = handles.generate_prestop_trap(
+            [container], _fake_metadata()
+        )
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            prestop_trap=prestop_trap,
+        )
+        assert "trap preStopTrap SIGTERM" in script
+
+    def test_no_trap_when_no_prestop(self):
+        container = _container("c1", "docker://busybox:latest")
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        assert "trap preStopTrap SIGTERM" not in script
+
+    def test_trap_defined_before_runctn_call(self):
+        container = self._container_with_prestop()
+        prestop_trap = handles.generate_prestop_trap([container], _fake_metadata())
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            prestop_trap=prestop_trap,
+        )
+        trap_pos = script.index("trap preStopTrap SIGTERM")
+        runctn_pos = script.index("runCtn c1")
+        assert trap_pos < runctn_pos
+
+    def test_trap_defined_after_runctn_helpers(self):
+        container = self._container_with_prestop()
+        prestop_trap = handles.generate_prestop_trap([container], _fake_metadata())
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            prestop_trap=prestop_trap,
+        )
+        helpers_pos = script.index("runCtn()")
+        trap_pos = script.index("trap preStopTrap SIGTERM")
+        assert helpers_pos < trap_pos
+
+
+class TestPrepareLifecycleHooks:
+    """Unit tests for prepare_lifecycle_hooks."""
+
+    def test_returns_empty_when_no_lifecycle(self):
+        containers = [{"name": "c1", "image": "busybox:latest"}]
+        result = handles.prepare_lifecycle_hooks(containers, _BASE_METADATA)
+        assert result == ""
+
+    def test_returns_trap_when_prestop_defined(self):
+        containers = [
+            {
+                "name": "c1",
+                "image": "busybox:latest",
+                "lifecycle": {
+                    "preStop": {"exec": {"command": ["/bin/sh", "-c", "quit"]}}
+                },
+            }
+        ]
+        result = handles.prepare_lifecycle_hooks(containers, _BASE_METADATA)
+        assert "preStopTrap" in result
+        assert "trap preStopTrap SIGTERM" in result
+
+    def test_returns_string(self):
+        containers = [{"name": "c1", "image": "busybox:latest"}]
+        result = handles.prepare_lifecycle_hooks(containers, _BASE_METADATA)
+        assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# postStart lifecycle hook tests
+# ---------------------------------------------------------------------------
+
+
+class TestPostStartHelpers:
+    """Unit tests for _find_tmp_bind_in_tokens, _find_image_in_tokens,
+    _inject_hook_tmp_into_cmd."""
+
+    def test_find_tmp_bind_not_present(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        assert handles._find_tmp_bind_in_tokens(tokens) is None
+
+    def test_find_tmp_bind_present(self):
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/host/tmp:/tmp",
+            "docker://busybox:latest",
+            "sh",
+        ]
+        assert handles._find_tmp_bind_in_tokens(tokens) == "/host/tmp"
+
+    def test_find_tmp_bind_in_comma_spec(self):
+        tokens = ["singularity", "exec", "--bind", "/a:/b,/h/t:/tmp", "docker://img", "sh"]
+        assert handles._find_tmp_bind_in_tokens(tokens) == "/h/t"
+
+    def test_find_image_docker_prefix(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        assert handles._find_image_in_tokens(tokens) == "docker://busybox:latest"
+
+    def test_find_image_cvmfs(self):
+        tokens = ["singularity", "exec", "/cvmfs/img.sif", "sh"]
+        assert handles._find_image_in_tokens(tokens) == "/cvmfs/img.sif"
+
+    def test_find_image_not_found(self):
+        tokens = ["singularity", "exec", "sh"]
+        assert handles._find_image_in_tokens(tokens) == ""
+
+    def test_inject_hook_tmp_adds_bind_before_image(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._inject_hook_tmp_into_cmd(tokens)
+        img_pos = result.index("docker://busybox:latest")
+        assert result[img_pos - 2] == "--bind"
+        assert "${workingPath}/hook-tmp:/tmp" in result[img_pos - 1]
+
+    def test_inject_hook_tmp_preserves_other_tokens(self):
+        tokens = ["singularity", "exec", "--bind", "src:/dst", "docker://img", "cmd"]
+        result = handles._inject_hook_tmp_into_cmd(tokens)
+        assert "singularity" in result
+        assert "docker://img" in result
+        assert "cmd" in result
+
+
+class TestGeneratePostStartFragment:
+    """Unit tests for _generate_poststart_fragment."""
+
+    def _base_metadata(self):
+        return {"name": "p", "uid": "u", "annotations": {}}
+
+    def test_exec_hook_runs_in_singularity(self):
+        hook = {"type": "exec", "command": ["/bin/sh", "-c", "echo hi"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, '"${workingPath}/hook-tmp:/tmp"', "singularity", "", tokens
+        )
+        assert "singularity" in result
+        assert "docker://busybox:latest" in result
+        assert "timeout" in result
+
+    def test_exec_hook_logs_to_container_out_file(self):
+        hook = {"type": "exec", "command": ["/bin/sh", "-c", "echo hi"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, '"${workingPath}/hook-tmp:/tmp"', "singularity", "", tokens
+        )
+        assert "${_IL_POD_NAME}-${_IL_POD_UID}-c1.out" in result
+
+    def test_httpget_hook_uses_curl(self):
+        hook = {
+            "type": "httpget",
+            "scheme": "http",
+            "host": "localhost",
+            "port": 8080,
+            "path": "/ready",
+        }
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "", tokens
+        )
+        assert "curl" in result
+        assert "http://localhost:8080/ready" in result
+
+    def test_hook_tmp_bind_included_in_singularity_call(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1",
+            hook,
+            '"${workingPath}/hook-tmp:/tmp"',
+            "singularity",
+            "",
+            tokens,
+        )
+        assert "${workingPath}/hook-tmp:/tmp" in result
+
+    def test_singularity_options_included(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://img", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "--nv", tokens
+        )
+        assert "--nv" in result
+
+    def test_completion_message_present(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://img", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "", tokens
+        )
+        assert "postStart hook for container c1 completed" in result
+
+
+class TestPostStartInScript:
+    """Integration tests: postStart hook is injected into the generated script."""
+
+    def _container_with_poststart(self, name="c1", image="docker://busybox:latest"):
+        return {
+            "name": name,
+            "image": image,
+            "lifecycle": {
+                "postStart": {"exec": {"command": ["/bin/sh", "-c", "echo started"]}}
+            },
+        }
+
+    def _poststart_hooks(self, container):
+        lifecycle = container.get("lifecycle") or {}
+        ps = lifecycle.get("postStart")
+        return {container["name"]: handles._translate_lifecycle_hook(ps) if ps else None}
+
+    def test_no_poststart_when_not_defined(self):
+        container = _container("c1", "docker://busybox:latest")
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        assert "postStart hook" not in script
+
+    def test_poststart_fragment_injected(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        assert "postStart hook for container c1" in script
+
+    def test_poststart_runs_before_runctn(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        ps_pos = script.index("postStart hook for container c1")
+        runctn_pos = script.index("runCtn c1")
+        assert ps_pos < runctn_pos
+
+    def test_hook_tmp_dir_created_when_no_tmp_mount(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        assert 'mkdir -p "${workingPath}/hook-tmp"' in script
+
+    def test_hook_tmp_bind_injected_into_runctn_command(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        # The runCtn call for c1 must include the hook-tmp bind
+        runctn_line = next(
+            ln for ln in script.splitlines() if ln.startswith("runCtn c1")
+        )
+        assert "${workingPath}/hook-tmp:/tmp" in runctn_line
+
+    def test_no_extra_hook_tmp_when_tmp_already_bound(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        # cmd_tokens already has a /tmp bind
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/host/tmp:/tmp",
+            "docker://busybox:latest",
+            "sh",
+        ]
+        script = _make_script(
+            [container],
+            [("c1", tokens)],
+            poststart_hooks=hooks,
+        )
+        # hook-tmp directory should NOT be created
+        assert 'mkdir -p "${workingPath}/hook-tmp"' not in script
 
 
 # ---------------------------------------------------------------------------
