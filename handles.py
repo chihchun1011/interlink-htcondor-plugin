@@ -460,11 +460,14 @@ def parse_string_with_suffix(value_str):
         "Gi": 1024,
     }
 
-    match = re.match(r"(\d+)([a-zA-Z]+)", value_str)
+    value_str = str(value_str).strip()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-zA-Z]+)?", value_str)
     if match:
         numeric_part = match.group(1)
         suffix = match.group(2)
-        if suffix in suffixes:
+        if suffix is None:
+            return max(1, int(math.ceil(float(numeric_part) / 1024**2)))
+        elif suffix in suffixes:
             numeric_value = int(float(numeric_part) * suffixes[suffix])
             return numeric_value
         else:
@@ -479,6 +482,32 @@ _LIFECYCLE_HOOK_TIMEOUT_SECONDS = 30
 
 # Regex to detect an existing --bind spec whose destination is /tmp.
 _RE_TMP_BIND = re.compile(r"([^,:\s]+):/tmp(?::|,|\s|$)")
+
+
+def _resolve_image(image):
+    """Apply a configured image override and return a Singularity image URI."""
+    overrides = InterLinkConfigInst.get("ImageOverrides", {}) or {}
+    if not isinstance(overrides, dict):
+        logging.warning("ImageOverrides must be a mapping; ignoring configured value")
+        overrides = {}
+    candidates = [image]
+    if image.startswith("docker://"):
+        candidates.append(image.removeprefix("docker://"))
+    else:
+        candidates.append("docker://" + image)
+
+    for candidate in candidates:
+        if candidate in overrides:
+            resolved = overrides[candidate]
+            if not isinstance(resolved, str) or not resolved:
+                logging.warning("Ignoring invalid image override for %s", candidate)
+                continue
+            logging.info("Using image override for %s: %s", image, resolved)
+            return resolved
+
+    if image.startswith("/") or image.startswith("docker://"):
+        return image
+    return "docker://" + image
 
 
 def _find_tmp_bind_in_tokens(cmd_tokens):
@@ -498,7 +527,7 @@ def _find_tmp_bind_in_tokens(cmd_tokens):
 def _find_image_in_tokens(cmd_tokens):
     """Return the first token that looks like a container image, or empty string."""
     for tok in cmd_tokens:
-        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+        if tok.startswith("docker://") or tok.startswith("/"):
             return tok
     return ""
 
@@ -513,7 +542,7 @@ def _inject_hook_tmp_into_cmd(cmd_tokens):
     """
     bind_val = '"${workingPath}/hook-tmp:/tmp"'
     for i, tok in enumerate(cmd_tokens):
-        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+        if tok.startswith("docker://") or tok.startswith("/"):
             new = list(cmd_tokens)
             new.insert(i, bind_val)
             new.insert(i, "--bind")
@@ -689,9 +718,7 @@ def generate_prestop_trap(containers, metadata):
         hook = _translate_lifecycle_hook(prestop)
         if hook is None:
             continue
-        image = container.get("image", "")
-        if not (image.startswith("/cvmfs") or image.startswith("docker://")):
-            image = "docker://" + image
+        image = _resolve_image(container.get("image", ""))
         entries.append({"name": container["name"], "hook": hook, "image": image})
 
     if not entries:
@@ -804,9 +831,7 @@ def prepare_probes(container, metadata):
     if not readiness and not liveness and not startup:
         return "", ""
 
-    image = container.get("image", "")
-    if not (image.startswith("/cvmfs") or image.startswith("docker://")):
-        image = "docker://" + image
+    image = _resolve_image(container.get("image", ""))
     opts = singularity_options.split() if singularity_options else []
 
     probe_script = generate_probe_script(
@@ -1009,6 +1034,28 @@ def produce_htcondor_singularity_script(
     if poststart_hooks is None:
         poststart_hooks = {}
 
+    # FullMesh pre-exec
+    _MESH_MARKER = "EOFMESH"
+
+    def _split_mesh_pre_exec(commands):
+        """Extract mesh heredoc."""
+        heredoc = ""
+        stripped = []
+        for ctn_name, tokens in commands:
+            if tokens and _MESH_MARKER in tokens[0]:
+                heredoc = heredoc or tokens[0]
+                tokens = tokens[1:]
+            stripped.append((ctn_name, list(tokens)))
+        return heredoc, stripped
+
+    _mesh_init, init_container_commands = _split_mesh_pre_exec(init_container_commands)
+    _mesh_main, container_commands = _split_mesh_pre_exec(container_commands)
+    mesh_pre_exec = _mesh_init or _mesh_main
+    if mesh_pre_exec:
+        logging.info(
+            "Mesh pre-exec detected: launching first container via $TMPDIR/mesh.sh"
+        )
+
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
@@ -1022,15 +1069,16 @@ def produce_htcondor_singularity_script(
 
     requested_cpus = 0
     requested_memory = 0
+    requested_gpus = 0
     for c in containers:
-        if "resources" in c.keys():
-            if "requests" in c["resources"].keys():
-                if "cpu" in c["resources"]["requests"].keys():
-                    requested_cpus += parse_cpu(c["resources"]["requests"]["cpu"])
-                if "memory" in c["resources"]["requests"].keys():
-                    requested_memory += parse_string_with_suffix(
-                        c["resources"]["requests"]["memory"]
-                    )
+        if "resources" in c:
+            limits = c["resources"].get("limits", {})
+            if "cpu" in limits:
+                requested_cpus += parse_cpu(limits["cpu"])
+            if "memory" in limits:
+                requested_memory += parse_string_with_suffix(limits["memory"])
+            if "nvidia.com/gpu" in limits:
+                requested_gpus += int(limits["nvidia.com/gpu"])
     if requested_cpus == 0:
         requested_cpus = 1
     if requested_memory == 0:
@@ -1082,6 +1130,14 @@ def produce_htcondor_singularity_script(
             if prefix_.strip():
                 script_body += "\n" + prefix_.strip() + "\n"
 
+            # Mesh bootstrap
+            if mesh_pre_exec:
+                script_body += (
+                    "\n# FullMesh\n"
+                    'export TMPDIR="${TMPDIR:-$(mktemp -d)}"\n'
+                    'mkdir -p "$TMPDIR"\n' + mesh_pre_exec.strip() + "\n"
+                )
+
             # ---- probe background sub-shells ----------------------------
             for ps in probe_scripts:
                 script_body += "\n" + ps + "\n"
@@ -1126,6 +1182,7 @@ def produce_htcondor_singularity_script(
                 "slurm-job.vk.io/singularity-options", ""
             )
 
+            _mesh_wrapped = False
             for ctn_name, cmd_tokens in container_commands:
                 hook = poststart_hooks.get(ctn_name)
                 if hook:
@@ -1151,7 +1208,14 @@ def produce_htcondor_singularity_script(
                     cleaned = _clean_command_tokens(final_tokens)
                 else:
                     cleaned = _clean_command_tokens(cmd_tokens)
-                script_body += f"runCtn {ctn_name} {cleaned}\n"
+                # Mesh wrapper
+                if mesh_pre_exec and not _mesh_wrapped:
+                    script_body += (
+                        f'runCtn {ctn_name} bash "$TMPDIR/mesh.sh" {cleaned}\n'
+                    )
+                    _mesh_wrapped = True
+                else:
+                    script_body += f"runCtn {ctn_name} {cleaned}\n"
 
             # ---- wait for all containers and exit -----------------------
             script_body += "\nwaitCtns\nendScript\n"
@@ -1198,6 +1262,7 @@ Error      = err/mm_mul.err.$(Cluster).$(Process)
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
+RequestGpus = {requested_gpus}
 
 # Retry if the job is held due to the permission error (Code 12, Subcode 13)
 periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
@@ -1452,6 +1517,9 @@ def SubmitHandler():
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
+            if "nvidia.com/gpu" in container.get("resources", {}).get("limits", {}):
+                if "--nv" not in singularity_options:
+                    singularity_options = ("--nv " + singularity_options).strip()
             pre_exec = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/pre-exec", ""
             )
@@ -1465,12 +1533,7 @@ def SubmitHandler():
                 container, metadata, container_standalone
             )
             env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
-            if container["image"].startswith("/cvmfs") or container["image"].startswith(
-                "docker://"
-            ):
-                image = container["image"]
-            else:
-                image = "docker://" + container["image"]
+            image = _resolve_image(container["image"])
             for mount in mounts[-1].split(","):
                 if "/cvmfs" not in mount:
                     mount_src = mount.split(":")[0]
@@ -1559,6 +1622,9 @@ def SubmitHandler():
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
+            if "nvidia.com/gpu" in container.get("resources", {}).get("limits", {}):
+                if "--nv" not in singularity_options:
+                    singularity_options = ("--nv " + singularity_options).strip()
 
             # flags = metadata.get("annotations", {}).get(
             #     "slurm-job.vk.io/flags", "")
@@ -1589,12 +1655,7 @@ def SubmitHandler():
             #        logging.warning(
             #            "image-uri not specified for path in remote filesystem"
             #        )
-            if container["image"].startswith("/cvmfs") or container["image"].startswith(
-                "docker://"
-            ):
-                image = container["image"]
-            else:
-                image = "docker://" + container["image"]
+            image = _resolve_image(container["image"])
             # image = container["image"]
             logging.info("Appending all commands together...")
             for mount in mounts[-1].split(","):
